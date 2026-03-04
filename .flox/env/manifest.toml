@@ -1,0 +1,40 @@
+## Flox Environment Manifest -----------------------------------------
+##
+##   _Everything_ you need to know about the _manifest_ is here:
+##
+##   https://flox.dev/docs/reference/command-reference/manifest.toml/
+##
+## -------------------------------------------------------------------
+# Flox manifest version managed by Flox CLI
+version = 1
+
+
+## Install Packages --------------------------------------------------
+[install]
+
+
+## Environment Variables ---------------------------------------------
+[vars]
+
+
+## Activation Hook ---------------------------------------------------
+[hook]
+
+
+## Profile script ----------------------------------------------------
+[profile]
+
+
+## Services ---------------------------------------------------------
+[services]
+
+
+## Build and publish your own packages ------------------------------
+[build]
+
+[build.llamacpp-flox-runtime]
+systems = ["aarch64-linux", "x86_64-linux"]
+
+
+## Other Environment Options -----------------------------------------
+[options]

@@ -1,0 +1,1221 @@
+#!/usr/bin/env bash
+# llamacpp-resolve-model — multi-source GGUF provisioning with staging + pin + checksum support.
+#
+# Required:
+#   LLAMACPP_MODEL         model name/slug (may end with .gguf)
+#   LLAMACPP_MODELS_DIR    base directory for installed models
+#
+# Optional identity:
+#   LLAMACPP_MODEL_ID        HF repo id (org/repo)
+#   LLAMACPP_MODEL_ORG       HF org used to derive model_id when MODEL_ID not set
+#   LLAMACPP_MODEL_REVISION  HF revision (commit hash or tag) for hf-hub/hf-cache
+#
+# Optional selection:
+#   LLAMACPP_MODEL_FILE    GGUF filename inside repo/dir
+#   LLAMACPP_QUANT         hint used to pick one GGUF when multiple exist (e.g. Q4_K_M)
+#   LLAMACPP_MODEL_SOURCES comma-separated source order (default: local,hf-cache,r2,hf-hub)
+#
+# Env file:
+#   FLOX_ENV_CACHE           base dir for env files
+#   LLAMACPP_MODEL_ENV_FILE  override env file path
+#
+# R2 (S3-compatible):
+#   R2_BUCKET, R2_MODELS_PREFIX, R2_ENDPOINT_URL (optional)
+#
+# Integrity:
+#   LLAMACPP_EXPECTED_SHA256       expected sha256 for a single GGUF (non-split)
+#   LLAMACPP_MANIFEST_PATH         path to sha256 manifest ("<sha>  <file>" or "<sha> *<file>")
+#   LLAMACPP_SHA256_MANIFEST_NAME  manifest filename to look for in model dir (default: manifest.sha256)
+#   LLAMACPP_REQUIRE_MANIFEST=1    fail if manifest is missing
+#   LLAMACPP_INTEGRITY_STRICT=1    require manifest entry for every selected file (incl. all shards)
+#
+# HF symlink policy (staged hf-hub downloads):
+#   LLAMACPP_ALLOW_SYMLINKS=1        allow symlinks in staged dir
+#   LLAMACPP_DEREFERENCE_SYMLINKS=1  copy dereferenced contents into staged dir
+#     default: reject symlinks
+#
+# Name policy:
+#   LLAMACPP_ALLOW_UNSAFE_NAME=1  allow names outside ^[A-Za-z0-9._-]+(\.gguf)?$
+#
+# GGUF validation:
+#   LLAMACPP_STRICT_GGUF_VALIDATE=0|1
+#     default: 1 when python3 exists, else 0
+#
+# Retry/backoff:
+#   LLAMACPP_RETRY_COUNT (default 3)
+#   LLAMACPP_RETRY_BASE_DELAY (seconds, default 1)
+#
+# Lock timeout:
+#   LLAMACPP_RESOLVE_LOCK_TIMEOUT (default 300)
+#
+# Backups:
+#   LLAMACPP_BACKUP_KEEP (default 2)  keep newest N backups; 0 disables backups
+#
+# Optional policy:
+#   LLAMACPP_REQUIRE_REVISION_FOR_HF=1        require LLAMACPP_MODEL_REVISION when hf-hub is used
+#   LLAMACPP_REQUIRE_IMMUTABLE_REVISION=1     require 40-hex commit hash for LLAMACPP_MODEL_REVISION
+
+set -euo pipefail
+umask 077
+
+_die()  { echo "ERROR: $*" >&2; exit 1; }
+_warn() { echo "WARNING: $*" >&2; }
+_has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+_slugify() { printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'; }
+
+_sha256_12() {
+  local input="$1"
+  if _has_cmd sha256sum; then printf '%s' "$input" | sha256sum | awk '{print substr($1,1,12)}'; return 0; fi
+  if _has_cmd shasum; then   printf '%s' "$input" | shasum -a 256 | awk '{print substr($1,1,12)}'; return 0; fi
+  if _has_cmd openssl; then  printf '%s' "$input" | openssl dgst -sha256 | awk '{print substr($NF,1,12)}'; return 0; fi
+  if _has_cmd python3; then
+    python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode('utf-8')).hexdigest()[:12])" "$input"
+    return 0
+  fi
+  return 1
+}
+
+_sha256_file() {
+  local p="$1"
+  if _has_cmd sha256sum; then sha256sum "$p" | awk '{print $1}'; return 0; fi
+  if _has_cmd shasum; then   shasum -a 256 "$p" | awk '{print $1}'; return 0; fi
+  if _has_cmd openssl; then  openssl dgst -sha256 "$p" | awk '{print $NF}'; return 0; fi
+  if _has_cmd python3; then
+    python3 - "$p" <<'PY'
+import hashlib,sys
+p=sys.argv[1]
+h=hashlib.sha256()
+with open(p,'rb') as f:
+  for b in iter(lambda:f.read(1024*1024), b''):
+    h.update(b)
+print(h.hexdigest())
+PY
+    return 0
+  fi
+  return 1
+}
+
+_abspath() {
+  local p="$1"
+  if _has_cmd realpath; then realpath "$p"; return $?; fi
+  if _has_cmd python3; then python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$p"; return $?; fi
+  local d b
+  d="$(cd "$(dirname "$p")" && pwd -P)" || return 1
+  b="$(basename "$p")"
+  printf '%s/%s\n' "$d" "$b"
+}
+
+_validate_model_name() {
+  local name="$1"
+  [[ -n "$name" ]] || _die "LLAMACPP_MODEL is empty"
+  [[ "$name" != */* ]] || _die "LLAMACPP_MODEL must not contain '/': $name"
+  [[ "$name" != *'\'* ]] || _die "LLAMACPP_MODEL must not contain '\\': $name"
+  [[ "$name" != "." && "$name" != ".." ]] || _die "LLAMACPP_MODEL must not be '.' or '..': $name"
+  [[ "$name" != *$'\n'* && "$name" != *$'\r'* && "$name" != *$'\t'* ]] || _die "LLAMACPP_MODEL must not contain control whitespace"
+
+  if [[ "${LLAMACPP_ALLOW_UNSAFE_NAME:-0}" != "1" ]]; then
+    [[ "$name" =~ ^[A-Za-z0-9._-]+(\.gguf)?$ ]] || _die "LLAMACPP_MODEL must match ^[A-Za-z0-9._-]+(\\.gguf)?$ (set LLAMACPP_ALLOW_UNSAFE_NAME=1 to override)"
+  fi
+}
+
+_run_to_log_retry() {
+  local log="$1" tries="$2" base_delay="$3"; shift 3
+  : >"$log"
+  local attempt=1 delay="$base_delay"
+  while true; do
+    echo "== attempt $attempt ==" >>"$log"
+    if "$@" >>"$log" 2>&1; then
+      return 0
+    fi
+    if (( attempt >= tries )); then
+      return 1
+    fi
+    echo "== failed; sleeping ${delay}s ==" >>"$log"
+    sleep "$delay"
+    delay=$((delay*2))
+    attempt=$((attempt+1))
+  done
+}
+
+_tail_one_line() {
+  local log="$1"
+  local n="${2:-80}"
+  tail -n "$n" "$log" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g'
+}
+
+# ---------------- GGUF validation ----------------
+
+_strict_gguf_default() {
+  if [[ -z "${LLAMACPP_STRICT_GGUF_VALIDATE:-}" ]]; then
+    if _has_cmd python3; then echo "1"; else echo "0"; fi
+  else
+    echo "${LLAMACPP_STRICT_GGUF_VALIDATE}"
+  fi
+}
+
+_check_gguf_file_basic() {
+  local filepath="$1"
+  [[ -f "$filepath" && -r "$filepath" && -s "$filepath" ]] || return 1
+  local magic
+  magic="$(od -An -tx1 -N4 "$filepath" 2>/dev/null | tr -d ' ')" || return 1
+  [[ "$magic" == "47475546" ]] || return 1
+  return 0
+}
+
+_check_gguf_file_strict_py() {
+  local filepath="$1"
+  python3 - "$filepath" <<'PY'
+import os, struct, sys
+p = sys.argv[1]
+size = os.stat(p).st_size
+with open(p, "rb") as f:
+  hdr = f.read(24)
+  if len(hdr) < 24: sys.exit(2)
+  magic, ver, tensor_count, kv_count = struct.unpack("<4sIQQ", hdr)
+  if magic != b"GGUF": sys.exit(3)
+  if ver < 1 or ver > 100: sys.exit(4)
+  if tensor_count > 10_000_000 or kv_count > 10_000_000: sys.exit(5)
+  off = 24
+
+  def need(n):
+    nonlocal off
+    if off + n > size: raise EOFError
+    b = f.read(n)
+    if len(b) != n: raise EOFError
+    off += n
+    return b
+
+  def u32(): return struct.unpack("<I", need(4))[0]
+  def u64(): return struct.unpack("<Q", need(8))[0]
+  def skip(n): need(n)
+
+  def skip_string():
+    n = u64()
+    if n > size: raise EOFError
+    skip(n)
+
+  # 0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 f32, 7 bool(1B), 8 string, 9 array, 10 u64, 11 i64, 12 f64
+  def skip_scalar(t, count=1):
+    if t in (0, 1, 7):        skip(1 * count)
+    elif t in (2, 3):         skip(2 * count)
+    elif t in (4, 5, 6):      skip(4 * count)
+    elif t in (10, 11, 12):   skip(8 * count)
+    else:
+      raise EOFError
+
+  def skip_value(t):
+    if t in (0,1,2,3,4,5,6,7,10,11,12):
+      skip_scalar(t); return
+    if t == 8:
+      skip_string(); return
+    if t == 9:
+      et = u32()
+      cnt = u64()
+      if cnt > 10_000_000: raise EOFError
+      if et == 8:
+        for _ in range(cnt): skip_string()
+      else:
+        skip_scalar(et, cnt)
+      return
+    raise EOFError
+
+  try:
+    for _ in range(kv_count):
+      skip_string()
+      t = u32()
+      skip_value(t)
+  except EOFError:
+    sys.exit(6)
+
+  if off >= size:
+    sys.exit(7)
+
+sys.exit(0)
+PY
+}
+
+_check_gguf_file() {
+  local filepath="$1"
+  local strict="$(_strict_gguf_default)"
+  if [[ "$strict" == "1" ]] && _has_cmd python3; then
+    _check_gguf_file_strict_py "$filepath"
+    return $?
+  fi
+  _check_gguf_file_basic "$filepath"
+}
+
+# Split helpers
+
+_split_shards_list() {
+  local first_bn="$1"
+  if [[ ! "$first_bn" =~ ^(.*)-([0-9]+)-of-([0-9]+)\.gguf$ ]]; then
+    return 1
+  fi
+  local prefix="${BASH_REMATCH[1]}"
+  local part_str="${BASH_REMATCH[2]}"
+  local total_str="${BASH_REMATCH[3]}"
+  local width="${#part_str}"
+  local total=$((10#$total_str))
+  local part
+  for ((part=1; part<=total; part++)); do
+    printf '%s-%0*d-of-%s.gguf\n' "$prefix" "$width" "$part" "$total_str"
+  done
+}
+
+_check_split_complete() {
+  local dir="$1" first_bn="$2"
+  _check_gguf_file "$dir/$first_bn" || return 1
+  while IFS= read -r s; do
+    [[ -f "$dir/$s" ]] || return 1
+  done < <(_split_shards_list "$first_bn")
+  return 0
+}
+
+_FIND_GGUF_ERR=""
+_validate_gguf_path() {
+  local dir="$1" filepath="$2"
+  local bn
+  bn="$(basename "$filepath")"
+  [[ -f "$filepath" ]] || { _FIND_GGUF_ERR="missing file: $filepath"; return 1; }
+
+  if [[ "$bn" =~ -00001-of-[0-9]+\.gguf$ ]]; then
+    _check_gguf_file "$filepath" || { _FIND_GGUF_ERR="GGUF check failed: $bn"; return 1; }
+    _check_split_complete "$dir" "$bn" || { _FIND_GGUF_ERR="split set incomplete for $bn in $dir"; return 1; }
+    return 0
+  fi
+
+  _check_gguf_file "$filepath" || { _FIND_GGUF_ERR="GGUF check failed: $bn"; return 1; }
+  return 0
+}
+
+_find_gguf_in_dir() {
+  local dir="$1"
+  _FIND_GGUF_ERR=""
+
+  if [[ -n "${LLAMACPP_MODEL_FILE:-}" ]]; then
+    local explicit="$dir/$LLAMACPP_MODEL_FILE"
+    if _validate_gguf_path "$dir" "$explicit"; then
+      _abspath "$explicit"
+      return 0
+    fi
+    _FIND_GGUF_ERR="LLAMACPP_MODEL_FILE invalid or missing: $explicit (${_FIND_GGUF_ERR})"
+    return 1
+  fi
+
+  shopt -s nullglob
+  local all=( "$dir"/*.gguf )
+  shopt -u nullglob
+
+  local candidates=() split_firsts=() f bn
+  for f in "${all[@]}"; do
+    bn="$(basename "$f")"
+    if [[ "$bn" =~ ^(.*)-[0-9]+-of-[0-9]+\.gguf$ ]]; then
+      [[ "$bn" =~ ^(.*)-00001-of-[0-9]+\.gguf$ ]] && split_firsts+=("$f")
+    else
+      candidates+=("$f")
+    fi
+  done
+  if ((${#candidates[@]}==0 && ${#split_firsts[@]}>0)); then
+    candidates=("${split_firsts[@]}")
+  fi
+  ((${#candidates[@]}==0)) && { _FIND_GGUF_ERR="no .gguf files in $dir"; return 1; }
+
+  if [[ -n "${LLAMACPP_QUANT:-}" ]]; then
+    local q
+    q="$(printf '%s' "$LLAMACPP_QUANT" | tr '[:upper:]' '[:lower:]')"
+    local matched=()
+    for f in "${candidates[@]}"; do
+      bn="$(basename "$f" | tr '[:upper:]' '[:lower:]')"
+      [[ "$bn" == *"$q"* ]] && matched+=("$f")
+    done
+    if ((${#matched[@]}==1)); then
+      _validate_gguf_path "$dir" "${matched[0]}" || { _FIND_GGUF_ERR="quant match failed (${_FIND_GGUF_ERR})"; return 1; }
+      _abspath "${matched[0]}"
+      return 0
+    fi
+    if ((${#matched[@]}>1)); then
+      local names=""
+      for f in "${matched[@]}"; do names+="  $(basename "$f")"$'\n'; done
+      _FIND_GGUF_ERR="quant hint matched multiple files; set LLAMACPP_MODEL_FILE:"$'\n'"$names"
+      return 1
+    fi
+  fi
+
+  if ((${#candidates[@]}==1)); then
+    _validate_gguf_path "$dir" "${candidates[0]}" || { _FIND_GGUF_ERR="single candidate failed (${_FIND_GGUF_ERR})"; return 1; }
+    _abspath "${candidates[0]}"
+    return 0
+  fi
+
+  local names=""
+  for f in "${candidates[@]}"; do names+="  $(basename "$f")"$'\n'; done
+  _FIND_GGUF_ERR="multiple .gguf files found; set LLAMACPP_MODEL_FILE or LLAMACPP_QUANT:"$'\n'"$names"
+  return 1
+}
+
+# ---------------- Manifest + integrity + sha file ----------------
+
+_manifest_pick() {
+  local dir="$1"
+  if [[ -n "${LLAMACPP_MANIFEST_PATH:-}" ]]; then
+    [[ -f "$LLAMACPP_MANIFEST_PATH" ]] && { printf '%s' "$LLAMACPP_MANIFEST_PATH"; return 0; }
+    _die "LLAMACPP_MANIFEST_PATH set but missing: $LLAMACPP_MANIFEST_PATH"
+  fi
+  local name="${LLAMACPP_SHA256_MANIFEST_NAME:-manifest.sha256}"
+  [[ -f "$dir/$name" ]] && { printf '%s' "$dir/$name"; return 0; }
+  printf ''
+}
+
+_manifest_load_assoc() {
+  local manifest="$1"
+  declare -gA MANIFEST_HASH
+  MANIFEST_HASH=()
+
+  local line hash rest file
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(_trim "$line")"
+    [[ -z "$line" ]] && continue
+    [[ "$line" == \#* ]] && continue
+
+    hash="${line%%[[:space:]]*}"
+    rest="${line#"$hash"}"
+    rest="$(_trim "$rest")"
+    [[ -z "$hash" || -z "$rest" ]] && continue
+
+    file="${rest#\*}"
+    file="$(_trim "$file")"
+
+    [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || continue
+    MANIFEST_HASH["$file"]="$(printf '%s' "$hash" | tr '[:upper:]' '[:lower:]')"
+  done < "$manifest"
+}
+
+_integrity_verify_files() {
+  local dir="$1"; shift
+  local manifest="$1"; shift
+  local expected="$1"; shift
+
+  local strict="${LLAMACPP_INTEGRITY_STRICT:-0}"
+  local require_manifest="${LLAMACPP_REQUIRE_MANIFEST:-0}"
+
+  if [[ -n "$manifest" ]]; then
+    _manifest_load_assoc "$manifest"
+  else
+    [[ "$require_manifest" == "1" ]] && _die "manifest required but not found (LLAMACPP_REQUIRE_MANIFEST=1)"
+  fi
+
+  local base path want got
+  for base in "$@"; do
+    path="$dir/$base"
+    [[ -f "$path" ]] || _die "integrity: missing file: $path"
+
+    want=""
+    if [[ -n "$manifest" ]]; then
+      want="${MANIFEST_HASH["$base"]:-}"
+      if [[ -z "$want" && "$strict" == "1" ]]; then
+        _die "integrity: manifest missing entry for $base (LLAMACPP_INTEGRITY_STRICT=1)"
+      fi
+    fi
+
+    if [[ -z "$want" && -n "$expected" ]]; then
+      if (( $# != 1 )); then
+        _die "LLAMACPP_EXPECTED_SHA256 works only for single-file installs; use a manifest for multi-file installs"
+      fi
+      want="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+    fi
+
+    if [[ -n "$want" ]]; then
+      got="$(_sha256_file "$path" | tr '[:upper:]' '[:lower:]')" || _die "sha256 tool missing for $path"
+      [[ "$got" == "$want" ]] || _die "integrity: sha256 mismatch for $base (got $got, want $want)"
+    fi
+  done
+}
+
+_write_sha_file_atomically() {
+  # Writes "<sha>  <basename>" lines for selected files from dir to out_path.
+  local out_path="$1"; shift
+  local dir="$1"; shift
+
+  mkdir -p "$(dirname "$out_path")"
+  local tmp
+  tmp="$(mktemp "${out_path}.tmp.XXXXXX")"
+
+  local base path sha
+  : >"$tmp"
+  for base in "$@"; do
+    path="$dir/$base"
+    sha="$(_sha256_file "$path")" || _die "sha256 tool missing for $path"
+    printf '%s  %s\n' "$sha" "$base" >>"$tmp"
+  done
+
+  mv -f "$tmp" "$out_path"
+  chmod 600 "$out_path" 2>/dev/null || true
+}
+
+_sha_from_sha_file() {
+  local sha_file="$1" base="$2"
+  awk -v f="$base" '$2==f {print $1; exit}' "$sha_file"
+}
+
+# Collect selected basenames into SELECTED_FILES array
+SELECTED_FILES=()
+_collect_selected_files() {
+  local gguf_bn="$1"
+  SELECTED_FILES=()
+  if [[ "$gguf_bn" =~ -00001-of-[0-9]+\.gguf$ ]]; then
+    while IFS= read -r s; do SELECTED_FILES+=("$s"); done < <(_split_shards_list "$gguf_bn")
+  else
+    SELECTED_FILES+=("$gguf_bn")
+  fi
+}
+
+# ---------------- Env writing ----------------
+
+_write_env_atomically() {
+  local env_file="$1" model_id="$2" resolved_path="$3" via="$4" rev="$5" sha="$6" sha_file="$7"
+  mkdir -p "$(dirname "$env_file")"
+  local tmp
+  tmp="$(mktemp "${env_file}.tmp.XXXXXX")"
+  {
+    echo "# generated by llamacpp-resolve-model"
+    printf 'export LLAMACPP_MODEL=%q\n' "$LLAMACPP_MODEL"
+    printf 'export LLAMACPP_MODEL_ID=%q\n' "$model_id"
+    printf 'export _LLAMACPP_RESOLVED_MODEL_PATH=%q\n' "$resolved_path"
+    printf 'export _LLAMACPP_RESOLVED_VIA=%q\n' "$via"
+    printf 'export _LLAMACPP_RESOLVED_REVISION=%q\n' "$rev"
+    printf 'export _LLAMACPP_RESOLVED_SHA256=%q\n' "$sha"
+    printf 'export _LLAMACPP_RESOLVED_SHA256_FILE=%q\n' "$sha_file"
+  } >"$tmp"
+  mv -f "$tmp" "$env_file"
+  chmod 600 "$env_file" 2>/dev/null || true
+}
+
+# Verify + write sha file (outside model dirs), returns single-file sha in global RESOLVED_SHA_SINGLE
+RESOLVED_SHA_SINGLE=""
+_verify_and_write_shafile() {
+  local dir="$1"
+  local gguf_bn="$2"
+  local sha_out="$3"
+
+  RESOLVED_SHA_SINGLE=""
+
+  _collect_selected_files "$gguf_bn"
+
+  local manifest expected
+  manifest="$(_manifest_pick "$dir")"
+  expected="${LLAMACPP_EXPECTED_SHA256:-}"
+
+  _integrity_verify_files "$dir" "$manifest" "$expected" "${SELECTED_FILES[@]}"
+  _write_sha_file_atomically "$sha_out" "$dir" "${SELECTED_FILES[@]}"
+
+  if ((${#SELECTED_FILES[@]}==1)); then
+    RESOLVED_SHA_SINGLE="$(_sha256_file "$dir/${SELECTED_FILES[0]}")"
+  fi
+}
+
+# ---------------- Symlink policy (hf-hub stage only) ----------------
+
+_handle_symlinks_stage() {
+  local stage_dir="$1"
+  local allow="${LLAMACPP_ALLOW_SYMLINKS:-0}"
+  local deref="${LLAMACPP_DEREFERENCE_SYMLINKS:-0}"
+
+  local found=""
+  found="$(find "$stage_dir" -type l -print -quit 2>/dev/null || true)"
+  [[ -z "$found" ]] && return 0
+
+  if [[ "$allow" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ "$deref" == "1" ]]; then
+    local parent newdir
+    parent="$(dirname "$stage_dir")"
+    newdir="$(mktemp -d "${parent%/}/deref.XXXXXX")"
+    (cd "$stage_dir" && tar -chf - .) | (cd "$newdir" && tar -xf -)
+    rm -rf "$stage_dir"
+    mv "$newdir" "$stage_dir"
+
+    found="$(find "$stage_dir" -type l -print -quit 2>/dev/null || true)"
+    [[ -z "$found" ]] || _die "symlink dereference did not remove all symlinks: $found"
+    return 0
+  fi
+
+  _die "symlinks found under staged dir (policy=reject). Set LLAMACPP_ALLOW_SYMLINKS=1 or LLAMACPP_DEREFERENCE_SYMLINKS=1. Example: $found"
+}
+
+# ---------------- Backups + swap ----------------
+
+_prune_backups() {
+  local target="$1"
+  local keep="${LLAMACPP_BACKUP_KEEP:-2}"
+  (( keep >= 0 )) || keep=0
+
+  local backups=()
+  while IFS= read -r b; do backups+=("$b"); done < <(ls -td "${target}.bak."* 2>/dev/null || true)
+
+  local i=0
+  for b in "${backups[@]}"; do
+    i=$((i+1))
+    if (( i > keep )); then
+      rm -rf "$b" 2>/dev/null || true
+    fi
+  done
+}
+
+_make_backup_name() {
+  local target="$1"
+  local tmp
+  tmp="$(mktemp -d "${target}.bak.XXXXXX")"
+  rmdir "$tmp" 2>/dev/null || true
+  printf '%s' "$tmp"
+}
+
+_atomic_swap_dir() {
+  local staged="$1" target="$2"
+  local keep="${LLAMACPP_BACKUP_KEEP:-2}"
+  (( keep >= 0 )) || keep=0
+
+  local backup="$(_make_backup_name "$target")"
+  if [[ -e "$target" ]]; then
+    mv "$target" "$backup"
+  fi
+
+  if mv "$staged" "$target"; then
+    if (( keep <= 0 )); then
+      rm -rf "$backup" 2>/dev/null || true
+    else
+      _prune_backups "$target"
+    fi
+    return 0
+  fi
+
+  [[ -e "$backup" ]] && mv "$backup" "$target" || true
+  return 1
+}
+
+_mk_stage_dir() { mktemp -d "${1%/}/${2}.XXXXXX"; }
+
+# ---------------- HF download helpers ----------------
+
+_hf_supports_flag() {
+  local cmd="$1" flag="$2"
+  "$cmd" download --help 2>/dev/null | grep -q -- "$flag"
+}
+
+_hfcli_supports_revision() {
+  huggingface-cli download --help 2>/dev/null | grep -q -- '--revision'
+}
+
+_hf_download_files_to_dir() {
+  # Downloads one or more explicit files into out_dir. Honors revision pin or fails with code 2.
+  local repo_id="$1" out_dir="$2" log="$3" revision="$4"; shift 4
+  local tries="${LLAMACPP_RETRY_COUNT:-3}"
+  local base_delay="${LLAMACPP_RETRY_BASE_DELAY:-1}"
+
+  if _has_cmd hf; then
+    local extra=()
+    _hf_supports_flag hf '--local-dir-use-symlinks' && extra+=(--local-dir-use-symlinks False)
+
+    if [[ -n "$revision" ]]; then
+      if _hf_supports_flag hf '--revision'; then
+        extra+=(--revision "$revision")
+      else
+        echo "Revision pin requested (LLAMACPP_MODEL_REVISION=$revision) but 'hf' lacks --revision" >>"$log"
+        return 2
+      fi
+    fi
+
+    local f
+    for f in "$@"; do
+      _run_to_log_retry "$log" "$tries" "$base_delay" hf download "$repo_id" "$f" --local-dir "$out_dir" "${extra[@]}" || return $?
+    done
+    return 0
+  fi
+
+  if _has_cmd huggingface-cli; then
+    local extra=()
+    if [[ -n "$revision" ]]; then
+      if _hfcli_supports_revision; then
+        extra+=(--revision "$revision")
+      else
+        echo "Revision pin requested (LLAMACPP_MODEL_REVISION=$revision) but 'huggingface-cli' lacks --revision" >>"$log"
+        return 2
+      fi
+    fi
+
+    local f
+    for f in "$@"; do
+      _run_to_log_retry "$log" "$tries" "$base_delay" huggingface-cli download "$repo_id" "$f" --local-dir "$out_dir" --local-dir-use-symlinks False "${extra[@]}" || return $?
+    done
+    return 0
+  fi
+
+  if _has_cmd python3; then
+    : >"$log"
+    local f
+    for f in "$@"; do
+      python3 - "$repo_id" "$f" "$out_dir" "$revision" >>"$log" 2>&1 <<'PY' || return 1
+import sys
+repo_id, filename, out_dir, revision = sys.argv[1], sys.argv[2], sys.argv[3], (sys.argv[4] or None)
+from huggingface_hub import hf_hub_download
+path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision,
+                       local_dir=out_dir, local_dir_use_symlinks=False)
+print(path)
+PY
+    done
+    return 0
+  fi
+
+  echo "No HF download tool found (need hf, huggingface-cli, or python3+huggingface_hub)" >>"$log"
+  return 127
+}
+
+_hf_download_gguf_to_dir() {
+  # Downloads GGUFs into out_dir (explicit file if provided, else all *.gguf).
+  # Honors revision pin or fails with code 2.
+  local repo_id="$1" filename="$2" out_dir="$3" log="$4" revision="$5"
+  local tries="${LLAMACPP_RETRY_COUNT:-3}"
+  local base_delay="${LLAMACPP_RETRY_BASE_DELAY:-1}"
+
+  if _has_cmd hf; then
+    local extra=()
+    _hf_supports_flag hf '--local-dir-use-symlinks' && extra+=(--local-dir-use-symlinks False)
+
+    if [[ -n "$revision" ]]; then
+      if _hf_supports_flag hf '--revision'; then
+        extra+=(--revision "$revision")
+      else
+        echo "Revision pin requested (LLAMACPP_MODEL_REVISION=$revision) but 'hf' lacks --revision" >>"$log"
+        return 2
+      fi
+    fi
+
+    if [[ -n "$filename" ]]; then
+      _run_to_log_retry "$log" "$tries" "$base_delay" hf download "$repo_id" "$filename" --local-dir "$out_dir" "${extra[@]}"
+    else
+      _run_to_log_retry "$log" "$tries" "$base_delay" hf download "$repo_id" --include "*.gguf" --local-dir "$out_dir" "${extra[@]}"
+    fi
+    return $?
+  fi
+
+  if _has_cmd huggingface-cli; then
+    local extra=()
+    if [[ -n "$revision" ]]; then
+      if _hfcli_supports_revision; then
+        extra+=(--revision "$revision")
+      else
+        echo "Revision pin requested (LLAMACPP_MODEL_REVISION=$revision) but 'huggingface-cli' lacks --revision" >>"$log"
+        return 2
+      fi
+    fi
+
+    if [[ -n "$filename" ]]; then
+      _run_to_log_retry "$log" "$tries" "$base_delay" huggingface-cli download "$repo_id" "$filename" --local-dir "$out_dir" --local-dir-use-symlinks False "${extra[@]}"
+    else
+      _run_to_log_retry "$log" "$tries" "$base_delay" huggingface-cli download "$repo_id" --include "*.gguf" --local-dir "$out_dir" --local-dir-use-symlinks False "${extra[@]}"
+    fi
+    return $?
+  fi
+
+  if _has_cmd python3; then
+    : >"$log"
+    local attempt=1 delay="$base_delay"
+    while true; do
+      echo "== attempt $attempt ==" >>"$log"
+      if [[ -n "$filename" ]]; then
+        python3 - "$repo_id" "$filename" "$out_dir" "$revision" >>"$log" 2>&1 <<'PY' && return 0
+import sys
+repo_id, filename, out_dir, revision = sys.argv[1], sys.argv[2], sys.argv[3], (sys.argv[4] or None)
+from huggingface_hub import hf_hub_download
+path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision,
+                       local_dir=out_dir, local_dir_use_symlinks=False)
+print(path)
+PY
+      else
+        python3 - "$repo_id" "$out_dir" "$revision" >>"$log" 2>&1 <<'PY' && return 0
+import sys
+repo_id, out_dir, revision = sys.argv[1], sys.argv[2], (sys.argv[3] or None)
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id=repo_id, revision=revision, local_dir=out_dir,
+                  local_dir_use_symlinks=False, allow_patterns=["*.gguf"])
+print(out_dir)
+PY
+      fi
+
+      if (( attempt >= "${LLAMACPP_RETRY_COUNT:-3}" )); then
+        return 1
+      fi
+      echo "== failed; sleeping ${delay}s ==" >>"$log"
+      sleep "$delay"
+      delay=$((delay*2))
+      attempt=$((attempt+1))
+    done
+  fi
+
+  echo "No HF download tool found (need hf, huggingface-cli, or python3+huggingface_hub)" >>"$log"
+  return 127
+}
+
+_maybe_download_manifest_hf() {
+  # Downloads manifest into stage dir if manifest is required/strict and not already present,
+  # and LLAMACPP_MANIFEST_PATH is not set.
+  local repo_id="$1" stage_dir="$2" log="$3" revision="$4"
+
+  [[ -n "${LLAMACPP_MANIFEST_PATH:-}" ]] && return 0
+
+  local require_manifest="${LLAMACPP_REQUIRE_MANIFEST:-0}"
+  local strict="${LLAMACPP_INTEGRITY_STRICT:-0}"
+  local name="${LLAMACPP_SHA256_MANIFEST_NAME:-manifest.sha256}"
+
+  if [[ "$require_manifest" != "1" && "$strict" != "1" ]]; then
+    return 0
+  fi
+  [[ -f "$stage_dir/$name" ]] && return 0
+
+  _hf_download_files_to_dir "$repo_id" "$stage_dir" "$log" "$revision" "$name"
+  return $?
+}
+
+# ---------------- Inputs ----------------
+
+: "${LLAMACPP_MODEL:?Set LLAMACPP_MODEL}"
+: "${LLAMACPP_MODELS_DIR:?Set LLAMACPP_MODELS_DIR}"
+_validate_model_name "$LLAMACPP_MODEL"
+
+LLAMACPP_MODEL_ID="${LLAMACPP_MODEL_ID:-}"
+LLAMACPP_MODEL_ORG="${LLAMACPP_MODEL_ORG:-}"
+LLAMACPP_MODEL_REVISION="${LLAMACPP_MODEL_REVISION:-}"
+LLAMACPP_MODEL_FILE="${LLAMACPP_MODEL_FILE:-}"
+LLAMACPP_QUANT="${LLAMACPP_QUANT:-}"
+LLAMACPP_MODEL_SOURCES="${LLAMACPP_MODEL_SOURCES:-local,hf-cache,r2,hf-hub}"
+LLAMACPP_RESOLVE_LOCK_TIMEOUT="${LLAMACPP_RESOLVE_LOCK_TIMEOUT:-300}"
+LLAMACPP_REQUIRE_REVISION_FOR_HF="${LLAMACPP_REQUIRE_REVISION_FOR_HF:-0}"
+LLAMACPP_REQUIRE_IMMUTABLE_REVISION="${LLAMACPP_REQUIRE_IMMUTABLE_REVISION:-0}"
+
+mkdir -p "$LLAMACPP_MODELS_DIR"
+
+MODEL_DIR_NAME="$LLAMACPP_MODEL"
+if [[ "$MODEL_DIR_NAME" == *.gguf ]]; then
+  MODEL_DIR_NAME="${MODEL_DIR_NAME%.gguf}"
+fi
+
+_target_dir="$LLAMACPP_MODELS_DIR/$MODEL_DIR_NAME"
+
+_model_repo_name="$MODEL_DIR_NAME"
+_model_id=""
+if [[ -z "$LLAMACPP_MODEL_ID" ]]; then
+  if [[ -n "$LLAMACPP_MODEL_ORG" ]]; then
+    _model_id="$LLAMACPP_MODEL_ORG/$_model_repo_name"
+  else
+    _model_id="$_model_repo_name"
+  fi
+else
+  _model_id="$LLAMACPP_MODEL_ID"
+fi
+
+_model_slug="$(_slugify "$_model_id")"
+_hf_slug="${_model_id//\//--}"
+
+if [[ -z "${LLAMACPP_MODEL_ENV_FILE:-}" ]]; then
+  : "${FLOX_ENV_CACHE:?Set FLOX_ENV_CACHE or override LLAMACPP_MODEL_ENV_FILE}"
+  _hash12="$(_sha256_12 "$_model_id" 2>/dev/null || true)"
+  if [[ -n "$_hash12" ]]; then
+    LLAMACPP_MODEL_ENV_FILE="$FLOX_ENV_CACHE/llamacpp-model.${_model_slug}.${_hash12}.env"
+  else
+    LLAMACPP_MODEL_ENV_FILE="$FLOX_ENV_CACHE/llamacpp-model.${_model_slug}.env"
+  fi
+fi
+_model_env="$LLAMACPP_MODEL_ENV_FILE"
+mkdir -p "$(dirname "$_model_env")"
+
+# Per-model sha file path (default: next to env file)
+SHA_FILE_PATH="${LLAMACPP_SHA256_FILE_PATH:-${_model_env}.sha256}"
+SHA_FILE_ABS="$(_abspath "$SHA_FILE_PATH" 2>/dev/null || printf '%s' "$SHA_FILE_PATH")"
+
+if [[ "$LLAMACPP_REQUIRE_IMMUTABLE_REVISION" == "1" && -n "$LLAMACPP_MODEL_REVISION" ]]; then
+  [[ "$LLAMACPP_MODEL_REVISION" =~ ^[0-9a-fA-F]{40}$ ]] || _die "LLAMACPP_MODEL_REVISION must be a 40-hex commit hash (LLAMACPP_REQUIRE_IMMUTABLE_REVISION=1)"
+fi
+
+# Lock per target dir
+_lock_root="$LLAMACPP_MODELS_DIR/.locks"
+mkdir -p "$_lock_root"
+_lock_hash="$(_sha256_12 "$_target_dir" 2>/dev/null || true)"
+_lock_key="$(_slugify "$MODEL_DIR_NAME")"
+[[ -n "$_lock_hash" ]] && _lock_key="${_lock_key}.${_lock_hash}"
+_lock_file="$_lock_root/llamacpp-resolve.${_lock_key}.lock"
+_lock_dir="$_lock_root/llamacpp-resolve.${_lock_key}.lockdir"
+_lock_mode=""
+
+_now_epoch() { date +%s; }
+_is_pid_alive() { kill -0 "$1" >/dev/null 2>&1; }
+
+_acquire_lock() {
+  if _has_cmd flock; then
+    _lock_mode="flock"
+    exec 9>"$_lock_file"
+    flock -w "$LLAMACPP_RESOLVE_LOCK_TIMEOUT" 9 || _die "lock timeout: $_lock_file"
+    return 0
+  fi
+
+  _lock_mode="mkdir"
+  local i
+  for ((i=0; i<LLAMACPP_RESOLVE_LOCK_TIMEOUT; i++)); do
+    if mkdir "$_lock_dir" 2>/dev/null; then
+      printf '%s\n' "$$" >"$_lock_dir/pid" 2>/dev/null || true
+      printf '%s\n' "$(_now_epoch)" >"$_lock_dir/start" 2>/dev/null || true
+      return 0
+    fi
+
+    local pid start now age
+    pid=""; start=""
+    [[ -f "$_lock_dir/pid" ]] && pid="$(<"$_lock_dir/pid")"
+    [[ -f "$_lock_dir/start" ]] && start="$(<"$_lock_dir/start")"
+    if [[ "$pid" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ ]]; then
+      if ! _is_pid_alive "$pid"; then
+        now="$(_now_epoch)"
+        age=$(( now - start ))
+        (( age >= 30 )) && rm -rf "$_lock_dir" 2>/dev/null || true
+      fi
+    fi
+    sleep 1
+  done
+  _die "lock timeout: $_lock_dir"
+}
+
+_release_lock() {
+  [[ "$_lock_mode" == "mkdir" ]] && rm -rf "$_lock_dir" 2>/dev/null || true
+}
+
+_resolved_via=""
+_resolved_model=""
+_resolved_revision=""
+_resolved_sha=""
+_resolved_sha_file=""
+_did_resolve=0
+_source_errors=""
+_add_error() { _source_errors+=$'  '"$1"$'\n'; }
+
+_stage_base="$LLAMACPP_MODELS_DIR/.staging"
+mkdir -p "$_stage_base"
+_logfiles=()
+_stage_dirs=()
+
+_cleanup_stages() { for sd in "${_stage_dirs[@]}"; do [[ -d "$sd" ]] && rm -rf "$sd" || true; done; }
+_cleanup_logs_on_success() { for lf in "${_logfiles[@]}"; do [[ -f "$lf" ]] && rm -f "$lf" || true; done; }
+
+cleanup() {
+  _cleanup_stages
+  if [[ "${LLAMACPP_KEEP_LOGS:-0}" != "1" && "${_did_resolve:-0}" -eq 1 ]]; then
+    _cleanup_logs_on_success
+  fi
+  _release_lock
+}
+trap cleanup EXIT
+
+_acquire_lock
+
+# HF cache root
+_hf_cache_root="${HUGGINGFACE_HUB_CACHE:-}"
+if [[ -z "$_hf_cache_root" && -n "${HF_HOME:-}" ]]; then
+  _hf_cache_root="$HF_HOME/hub"
+fi
+[[ -n "$_hf_cache_root" ]] || _hf_cache_root="$LLAMACPP_MODELS_DIR/hub"
+
+# Policy: if hf-hub is in sources and pin required is on
+if [[ "$LLAMACPP_REQUIRE_REVISION_FOR_HF" == "1" ]]; then
+  IFS=',' read -ra _src_check <<< "$LLAMACPP_MODEL_SOURCES"
+  for s in "${_src_check[@]}"; do
+    s="$(_trim "$s")"
+    if [[ "$s" == "hf-hub" ]]; then
+      [[ -n "$LLAMACPP_MODEL_REVISION" ]] || _die "hf-hub requires LLAMACPP_MODEL_REVISION (LLAMACPP_REQUIRE_REVISION_FOR_HF=1)"
+    fi
+  done
+fi
+
+# Write env after we have final path (or stable cache path)
+_write_env_final() {
+  local model_path_abs="$1" via="$2" rev="$3" gguf_bn="$4"
+  local sha_single=""
+
+  if [[ ! "$gguf_bn" =~ -00001-of-[0-9]+\.gguf$ ]]; then
+    sha_single="$(_sha_from_sha_file "$SHA_FILE_PATH" "$gguf_bn" || true)"
+  fi
+
+  _write_env_atomically "$_model_env" "$_model_id" "$model_path_abs" "$via" "$rev" "$sha_single" "$SHA_FILE_ABS"
+
+  _resolved_via="$via"
+  _resolved_model="$model_path_abs"
+  _resolved_revision="$rev"
+  _resolved_sha="$sha_single"
+  _resolved_sha_file="$SHA_FILE_ABS"
+  _did_resolve=1
+}
+
+IFS=',' read -ra _sources <<< "$LLAMACPP_MODEL_SOURCES"
+for _src in "${_sources[@]}"; do
+  _src="$(_trim "$_src")"
+  [[ -n "$_src" ]] || continue
+
+  case "$_src" in
+    local)
+      printf "[model] Checking local... "
+
+      if [[ "$LLAMACPP_MODEL" == *.gguf ]]; then
+        _direct_gguf="$LLAMACPP_MODELS_DIR/$LLAMACPP_MODEL"
+      else
+        _direct_gguf="$LLAMACPP_MODELS_DIR/${LLAMACPP_MODEL}.gguf"
+      fi
+
+      if [[ -f "$_direct_gguf" ]] && _validate_gguf_path "$LLAMACPP_MODELS_DIR" "$_direct_gguf"; then
+        _gguf_bn="$(basename "$_direct_gguf")"
+        _verify_and_write_shafile "$LLAMACPP_MODELS_DIR" "$_gguf_bn" "$SHA_FILE_PATH"
+        _model_abs="$(_abspath "$_direct_gguf" 2>/dev/null || printf '%s' "$_direct_gguf")"
+        _write_env_final "$_model_abs" "local" "" "$_gguf_bn"
+        echo "OK (direct file)"
+        break
+      fi
+
+      if [[ -d "$_target_dir" ]]; then
+        if _gguf_path="$(_find_gguf_in_dir "$_target_dir")"; then
+          _gguf_bn="$(basename "$_gguf_path")"
+          _verify_and_write_shafile "$_target_dir" "$_gguf_bn" "$SHA_FILE_PATH"
+          _write_env_final "$(_abspath "$_gguf_path")" "local" "" "$_gguf_bn"
+          echo "OK"
+          break
+        fi
+        echo "not found"
+        _add_error "local: $_target_dir exists but: ${_FIND_GGUF_ERR:-no valid GGUF found}"
+      else
+        echo "not found"
+        _add_error "local: neither direct .gguf nor $_target_dir found"
+      fi
+      ;;
+
+    hf-cache)
+      printf "[model] Checking HF cache... "
+      _cache_dir="${_hf_cache_root%/}/models--${_hf_slug}"
+
+      if [[ ! -d "$_cache_dir/snapshots" ]]; then
+        echo "not found"
+        _add_error "hf-cache: no HF cache at ${_cache_dir}/"
+        continue
+      fi
+
+      # If a pin is set, only accept that snapshot id
+      if [[ -n "$LLAMACPP_MODEL_REVISION" ]]; then
+        if [[ -d "$_cache_dir/snapshots/$LLAMACPP_MODEL_REVISION" ]]; then
+          _snap="$_cache_dir/snapshots/$LLAMACPP_MODEL_REVISION"
+          if _gguf_path="$(_find_gguf_in_dir "$_snap")"; then
+            _gguf_bn="$(basename "$_gguf_path")"
+            _verify_and_write_shafile "$_snap" "$_gguf_bn" "$SHA_FILE_PATH"
+            _write_env_final "$(_abspath "$_gguf_path")" "hf-cache" "$LLAMACPP_MODEL_REVISION" "$_gguf_bn"
+            echo "OK (pinned snapshot)"
+            break
+          fi
+        fi
+        echo "not found"
+        _add_error "hf-cache: pinned snapshot not present or lacks usable GGUF"
+        continue
+      fi
+
+      # Try refs/main then scan snapshots
+      _ref="$_cache_dir/refs/main"
+      if [[ -f "$_ref" ]]; then
+        _rev="$(<"$_ref")"
+        _snap="$_cache_dir/snapshots/$_rev"
+        if [[ -d "$_snap" ]]; then
+          if _gguf_path="$(_find_gguf_in_dir "$_snap")"; then
+            _gguf_bn="$(basename "$_gguf_path")"
+            _verify_and_write_shafile "$_snap" "$_gguf_bn" "$SHA_FILE_PATH"
+            _write_env_final "$(_abspath "$_gguf_path")" "hf-cache" "$_rev" "$_gguf_bn"
+            echo "OK"
+            break
+          fi
+        fi
+      fi
+
+      _found=0
+      while IFS= read -r _snap_dir; do
+        [[ -d "$_snap_dir" ]] || continue
+        _snap_dir="${_snap_dir%/}"
+        _snap_rev="$(basename "$_snap_dir")"
+        if _gguf_path="$(_find_gguf_in_dir "$_snap_dir")"; then
+          _gguf_bn="$(basename "$_gguf_path")"
+          _verify_and_write_shafile "$_snap_dir" "$_gguf_bn" "$SHA_FILE_PATH"
+          _write_env_final "$(_abspath "$_gguf_path")" "hf-cache" "$_snap_rev" "$_gguf_bn"
+          _found=1
+          echo "OK"
+          break
+        fi
+      done < <(ls -td "$_cache_dir/snapshots"/*/ 2>/dev/null || true)
+
+      if [[ "$_found" -eq 1 ]]; then break; fi
+      echo "not found"
+      _add_error "hf-cache: no usable GGUF in ${_cache_dir}/ (last: ${_FIND_GGUF_ERR:-unknown})"
+      ;;
+
+    r2)
+      printf "[model] Fetching from R2... "
+      if ! _has_cmd aws; then
+        echo "skipped (aws not found)"
+        _add_error "r2: aws CLI not available"
+        continue
+      fi
+      if [[ -z "${R2_BUCKET:-}" || -z "${R2_MODELS_PREFIX:-}" ]]; then
+        echo "skipped (R2 vars not set)"
+        _add_error "r2: set R2_BUCKET and R2_MODELS_PREFIX"
+        continue
+      fi
+
+      _aws_endpoint_args=()
+      [[ -n "${R2_ENDPOINT_URL:-}" ]] && _aws_endpoint_args+=(--endpoint-url "$R2_ENDPOINT_URL")
+
+      stage_dir="$(_mk_stage_dir "$_stage_base" "${MODEL_DIR_NAME}.r2")"
+      _stage_dirs+=("$stage_dir")
+      logfile="$(mktemp "$_stage_base/${MODEL_DIR_NAME}.r2.log.XXXXXX")"
+      _logfiles+=("$logfile")
+
+      tries="${LLAMACPP_RETRY_COUNT:-3}"
+      base_delay="${LLAMACPP_RETRY_BASE_DELAY:-1}"
+
+      if _run_to_log_retry "$logfile" "$tries" "$base_delay" aws "${_aws_endpoint_args[@]}" s3 sync \
+          "s3://$R2_BUCKET/$R2_MODELS_PREFIX/$MODEL_DIR_NAME/" \
+          "$stage_dir/" \
+          --no-progress; then
+
+        if _gguf_path="$(_find_gguf_in_dir "$stage_dir")"; then
+          _gguf_bn="$(basename "$_gguf_path")"
+          : >"$stage_dir/.complete"
+
+          _verify_and_write_shafile "$stage_dir" "$_gguf_bn" "$SHA_FILE_PATH"
+
+          if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
+            _final_path="$_target_dir/$_gguf_bn"
+            _validate_gguf_path "$_target_dir" "$_final_path" || _die "post-swap GGUF validation failed: ${_FIND_GGUF_ERR:-unknown}"
+            _write_env_final "$(_abspath "$_final_path")" "r2" "" "$_gguf_bn"
+            echo "OK"
+            break
+          else
+            echo "failed (swap error)"
+            _add_error "r2: swap into $_target_dir failed (log: $logfile)"
+          fi
+        else
+          echo "failed (no GGUF)"
+          _add_error "r2: ${_FIND_GGUF_ERR:-no GGUF found in staged dir} (log: $logfile)"
+        fi
+      else
+        echo "failed (sync error)"
+        _add_error "r2: aws s3 sync failed — tail: $(_tail_one_line "$logfile" 80) (log: $logfile)"
+      fi
+
+      stage_dir=""
+      ;;
+
+    hf-hub)
+      printf "[model] Downloading from HuggingFace Hub... "
+      if [[ "$_model_id" != */* ]]; then
+        echo "skipped (no org/repo in model id)"
+        _add_error "hf-hub: model_id must be org/repo; set LLAMACPP_MODEL_ORG or LLAMACPP_MODEL_ID"
+        continue
+      fi
+
+      stage_dir="$(_mk_stage_dir "$_stage_base" "${MODEL_DIR_NAME}.hf")"
+      _stage_dirs+=("$stage_dir")
+      logfile="$(mktemp "$_stage_base/${MODEL_DIR_NAME}.hf.log.XXXXXX")"
+      _logfiles+=("$logfile")
+
+      _hf_filename=""
+      [[ -n "${LLAMACPP_MODEL_FILE:-}" ]] && _hf_filename="$LLAMACPP_MODEL_FILE"
+
+      if _hf_download_gguf_to_dir "$_model_id" "$_hf_filename" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION"; then
+        :
+      else
+        code=$?
+        if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
+          _die "hf-hub: revision pin requested but the selected tool cannot apply it (see log: $logfile)"
+        fi
+        echo "failed (download error)"
+        _add_error "hf-hub: download failed — tail: $(_tail_one_line "$logfile" 80) (log: $logfile)"
+        stage_dir=""
+        continue
+      fi
+
+      # If manifest is required/strict, fetch it too (when LLAMACPP_MANIFEST_PATH is not set)
+      if ! _maybe_download_manifest_hf "$_model_id" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION"; then
+        code=$?
+        if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
+          _die "hf-hub: revision pin requested but the selected tool cannot apply it for manifest download (see log: $logfile)"
+        fi
+        _die "hf-hub: manifest download failed (see log: $logfile)"
+      fi
+
+      _handle_symlinks_stage "$stage_dir"
+
+      if _gguf_path="$(_find_gguf_in_dir "$stage_dir")"; then
+        _gguf_bn="$(basename "$_gguf_path")"
+        : >"$stage_dir/.complete"
+
+        _verify_and_write_shafile "$stage_dir" "$_gguf_bn" "$SHA_FILE_PATH"
+
+        if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
+          _final_path="$_target_dir/$_gguf_bn"
+          _validate_gguf_path "$_target_dir" "$_final_path" || _die "post-swap GGUF validation failed: ${_FIND_GGUF_ERR:-unknown}"
+          _write_env_final "$(_abspath "$_final_path")" "hf-hub" "$LLAMACPP_MODEL_REVISION" "$_gguf_bn"
+          echo "OK"
+          break
+        else
+          echo "failed (swap error)"
+          _add_error "hf-hub: swap into $_target_dir failed (log: $logfile)"
+        fi
+      else
+        echo "failed (no GGUF)"
+        _add_error "hf-hub: ${_FIND_GGUF_ERR:-no GGUF found in staged dir} (log: $logfile)"
+      fi
+
+      stage_dir=""
+      ;;
+
+    *)
+      _warn "Unknown source '$_src' (skipping)"
+      ;;
+  esac
+done
+
+if [[ $_did_resolve -ne 1 ]]; then
+  echo "" >&2
+  echo "ERROR: Could not provision model '$LLAMACPP_MODEL' ($_model_id) from any source." >&2
+  echo "  Tried (LLAMACPP_MODEL_SOURCES=$LLAMACPP_MODEL_SOURCES):" >&2
+  printf '%b' "$_source_errors" >&2
+
+  if (( ${#_logfiles[@]} > 0 )); then
+    echo "" >&2
+    echo "  Logs kept for debugging:" >&2
+    for lf in "${_logfiles[@]}"; do
+      [[ -f "$lf" ]] && echo "    $lf" >&2
+    done
+    echo "  (Set LLAMACPP_KEEP_LOGS=1 to keep logs even on success.)" >&2
+  fi
+  exit 1
+fi
+
+echo "[model] Resolved: $_resolved_model (via $_resolved_via)"
+if [[ -n "$_resolved_revision" ]]; then
+  echo "[model] Revision: $_resolved_revision"
+else
+  echo "[model] Revision: (empty)"
+fi
+if [[ -n "$_resolved_sha" ]]; then
+  echo "[model] sha256: $_resolved_sha"
+fi
+echo "[model] sha256 file: $_resolved_sha_file"
+_env_abs="$(_abspath "$_model_env" 2>/dev/null || printf '%s' "$_model_env")"
+echo "[model] Env file: $_env_abs"
