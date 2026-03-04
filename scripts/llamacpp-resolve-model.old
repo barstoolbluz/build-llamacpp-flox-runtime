@@ -13,7 +13,7 @@
 # Optional selection:
 #   LLAMACPP_MODEL_FILE    GGUF filename inside repo/dir
 #   LLAMACPP_QUANT         hint used to pick one GGUF when multiple exist (e.g. Q4_K_M)
-#   LLAMACPP_MODEL_SOURCES comma-separated source order (default: local,r2,hf-hub)
+#   LLAMACPP_MODEL_SOURCES comma-separated source order (default: local,hf-cache,r2,hf-hub)
 #
 # Env file:
 #   FLOX_ENV_CACHE           base dir for env files
@@ -54,11 +54,6 @@
 # Optional policy:
 #   LLAMACPP_REQUIRE_REVISION_FOR_HF=1        require LLAMACPP_MODEL_REVISION when hf-hub is used
 #   LLAMACPP_REQUIRE_IMMUTABLE_REVISION=1     require 40-hex commit hash for LLAMACPP_MODEL_REVISION
-#   LLAMACPP_REQUIRE_REVISION_FOR_HF_CACHE=1  require LLAMACPP_MODEL_REVISION for hf-cache (no refs/main scan)
-#   LLAMACPP_REQUIRE_MANIFEST_FOR_SPLIT=1     require a sha256 manifest when selecting split GGUF sets
-#   LLAMACPP_VALIDATE_ALL_SHARDS=1            validate every shard header when selecting split GGUF sets
-#   LLAMACPP_ALLOW_SNAPSHOT_GGUF=1            allow hf-hub fallback that downloads many .gguf files (not recommended)
-#
 
 set -euo pipefail
 umask 077
@@ -281,21 +276,12 @@ _split_shards_list() {
 
 _check_split_complete() {
   local dir="$1" first_bn="$2"
-  local validate_all="${LLAMACPP_VALIDATE_ALL_SHARDS:-1}"
-
   _check_gguf_file "$dir/$first_bn" || return 1
-
   while IFS= read -r s; do
-    local p="$dir/$s"
-    [[ -f "$p" ]] || return 1
-    if [[ "$validate_all" == "1" && "$s" != "$first_bn" ]]; then
-      _check_gguf_file "$p" || return 1
-    fi
+    [[ -f "$dir/$s" ]] || return 1
   done < <(_split_shards_list "$first_bn")
-
   return 0
 }
-
 
 _FIND_GGUF_ERR=""
 _validate_gguf_path() {
@@ -531,11 +517,6 @@ _verify_and_write_shafile() {
   manifest="$(_manifest_pick "$dir")"
   expected="${LLAMACPP_EXPECTED_SHA256:-}"
 
-  local require_split_manifest="${LLAMACPP_REQUIRE_MANIFEST_FOR_SPLIT:-1}"
-  if ((${#SELECTED_FILES[@]} > 1)) && [[ "$require_split_manifest" == "1" ]]; then
-    [[ -n "$manifest" ]] || _die "integrity: split GGUF set selected but no manifest found; provide one (LLAMACPP_MANIFEST_PATH or ${LLAMACPP_SHA256_MANIFEST_NAME:-manifest.sha256}) or set LLAMACPP_REQUIRE_MANIFEST_FOR_SPLIT=0"
-  fi
-
   _integrity_verify_files "$dir" "$manifest" "$expected" "${SELECTED_FILES[@]}"
   _write_sha_file_atomically "$sha_out" "$dir" "${SELECTED_FILES[@]}"
 
@@ -683,10 +664,6 @@ _hf_download_files_to_dir() {
   fi
 
   if _has_cmd python3; then
-    if ! python3 -c "import huggingface_hub" >/dev/null 2>&1; then
-      echo "python3 found but huggingface_hub is not installed (need hf or huggingface-cli, or install huggingface_hub)" >>"$log"
-      return 127
-    fi
     : >"$log"
     local f
     for f in "$@"; do
@@ -710,10 +687,6 @@ _hf_download_gguf_to_dir() {
   # Downloads GGUFs into out_dir (explicit file if provided, else all *.gguf).
   # Honors revision pin or fails with code 2.
   local repo_id="$1" filename="$2" out_dir="$3" log="$4" revision="$5"
-  if [[ -z "$filename" && "${LLAMACPP_ALLOW_SNAPSHOT_GGUF:-0}" != "1" ]]; then
-    echo "Bulk snapshot download is disabled; set LLAMACPP_MODEL_FILE or LLAMACPP_QUANT (or set LLAMACPP_ALLOW_SNAPSHOT_GGUF=1 to allow it)" >>"$log"
-    return 2
-  fi
   local tries="${LLAMACPP_RETRY_COUNT:-3}"
   local base_delay="${LLAMACPP_RETRY_BASE_DELAY:-1}"
 
@@ -758,10 +731,6 @@ _hf_download_gguf_to_dir() {
   fi
 
   if _has_cmd python3; then
-    if ! python3 -c "import huggingface_hub" >/dev/null 2>&1; then
-      echo "python3 found but huggingface_hub is not installed (need hf or huggingface-cli, or install huggingface_hub)" >>"$log"
-      return 127
-    fi
     : >"$log"
     local attempt=1 delay="$base_delay"
     while true; do
@@ -800,143 +769,6 @@ PY
   return 127
 }
 
-
-_hf_can_download() {
-  _has_cmd hf && return 0
-  _has_cmd huggingface-cli && return 0
-  if _has_cmd python3 && python3 -c "import huggingface_hub" >/dev/null 2>&1; then return 0; fi
-  return 1
-}
-
-_hf_list_repo_root_files() {
-  # Prints root-level file names for the repo at the requested revision (one per line).
-  local repo_id="$1" revision="$2" log="$3"
-  [[ -n "$revision" ]] || revision="main"
-
-  if ! _has_cmd python3; then
-    echo "python3 is required to list repo files; set LLAMACPP_MODEL_FILE or install python3" >>"$log"
-    return 127
-  fi
-
-  python3 - "$repo_id" "$revision" 2>>"$log" <<'PY'
-import json, os, sys
-from urllib.parse import quote
-from urllib.request import Request, urlopen
-
-repo_id = sys.argv[1]
-revision = sys.argv[2]
-token = (os.environ.get("HF_TOKEN")
-         or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-         or os.environ.get("HUGGINGFACE_TOKEN"))
-
-def list_with_hub():
-  from huggingface_hub import HfApi
-  api = HfApi()
-  return api.list_repo_files(repo_id=repo_id, revision=revision)
-
-def list_with_http():
-  rid = quote(repo_id, safe="/")
-  rrev = quote(revision, safe="")
-  url = f"https://huggingface.co/api/models/{rid}/tree/{rrev}?recursive=1"
-  req = Request(url, headers={"User-Agent": "llamacpp-resolve-model/1"})
-  if token:
-    req.add_header("Authorization", f"Bearer {token}")
-  with urlopen(req, timeout=30) as resp:
-    data = json.load(resp)
-  files = []
-  if isinstance(data, list):
-    for x in data:
-      if isinstance(x, dict) and "path" in x:
-        files.append(str(x["path"]))
-  return files
-
-files = None
-try:
-  files = list_with_hub()
-except Exception:
-  files = list_with_http()
-
-for f in files:
-  # keep root-level only; subdirs complicate split detection and manifest mapping
-  if "/" in f:
-    continue
-  print(f)
-PY
-}
-
-_hf_pick_remote_gguf() {
-  # Selects a single GGUF (or first shard) name from repo_id at revision.
-  # Writes the selected filename to stdout.
-  local repo_id="$1" revision="$2" log="$3"
-
-  if [[ -n "${LLAMACPP_MODEL_FILE:-}" ]]; then
-    local explicit="$LLAMACPP_MODEL_FILE"
-    [[ "$explicit" != */* ]] || { echo "LLAMACPP_MODEL_FILE must be a basename (no /): $explicit" >>"$log"; return 2; }
-    [[ "$explicit" == *.gguf ]] || { echo "LLAMACPP_MODEL_FILE must end with .gguf: $explicit" >>"$log"; return 2; }
-    printf '%s' "$explicit"
-    return 0
-  fi
-
-  if [[ "${LLAMACPP_REQUIRE_FILE_OR_QUANT:-1}" == "1" && -z "${LLAMACPP_QUANT:-}" ]]; then
-    echo "Set LLAMACPP_MODEL_FILE or LLAMACPP_QUANT to pick a single GGUF (bulk snapshot is disabled by default)" >>"$log"
-    return 2
-  fi
-
-  local files=()
-  while IFS= read -r f; do files+=("$f"); done < <(_hf_list_repo_root_files "$repo_id" "$revision" "$log") || return $?
-
-  local ggufs=()
-  local f
-  for f in "${files[@]}"; do
-    [[ "$f" == *.gguf ]] || continue
-    # accept conservative filenames only
-    [[ "$f" =~ ^[A-Za-z0-9._-]+\.gguf$ ]] || continue
-    ggufs+=("$f")
-  done
-
-  ((${#ggufs[@]}==0)) && { echo "No root-level .gguf files found at revision $revision" >>"$log"; return 1; }
-
-  local candidates=() split_firsts=() bn
-  for bn in "${ggufs[@]}"; do
-    if [[ "$bn" =~ ^(.*)-[0-9]+-of-[0-9]+\.gguf$ ]]; then
-      [[ "$bn" =~ ^(.*)-00001-of-[0-9]+\.gguf$ ]] && split_firsts+=("$bn")
-    else
-      candidates+=("$bn")
-    fi
-  done
-  if ((${#candidates[@]}==0 && ${#split_firsts[@]}>0)); then
-    candidates=("${split_firsts[@]}")
-  fi
-
-  if [[ -n "${LLAMACPP_QUANT:-}" ]]; then
-    local q matched=()
-    q="$(printf '%s' "$LLAMACPP_QUANT" | tr '[:upper:]' '[:lower:]')"
-    for bn in "${candidates[@]}"; do
-      local lc
-      lc="$(printf '%s' "$bn" | tr '[:upper:]' '[:lower:]')"
-      [[ "$lc" == *"$q"* ]] && matched+=("$bn")
-    done
-    if ((${#matched[@]}==1)); then
-      printf '%s' "${matched[0]}"
-      return 0
-    fi
-    if ((${#matched[@]}>1)); then
-      echo "Quant hint matched multiple files; set LLAMACPP_MODEL_FILE:" >>"$log"
-      for bn in "${matched[@]}"; do echo "  $bn" >>"$log"; done
-      return 1
-    fi
-  fi
-
-  if ((${#candidates[@]}==1)); then
-    printf '%s' "${candidates[0]}"
-    return 0
-  fi
-
-  echo "Multiple .gguf files exist at revision $revision; set LLAMACPP_MODEL_FILE or LLAMACPP_QUANT:" >>"$log"
-  for bn in "${candidates[@]}"; do echo "  $bn" >>"$log"; done
-  return 1
-}
-
 _maybe_download_manifest_hf() {
   # Downloads manifest into stage dir if manifest is required/strict and not already present,
   # and LLAMACPP_MANIFEST_PATH is not set.
@@ -968,15 +800,10 @@ LLAMACPP_MODEL_ORG="${LLAMACPP_MODEL_ORG:-}"
 LLAMACPP_MODEL_REVISION="${LLAMACPP_MODEL_REVISION:-}"
 LLAMACPP_MODEL_FILE="${LLAMACPP_MODEL_FILE:-}"
 LLAMACPP_QUANT="${LLAMACPP_QUANT:-}"
-LLAMACPP_MODEL_SOURCES="${LLAMACPP_MODEL_SOURCES:-local,r2,hf-hub}"
+LLAMACPP_MODEL_SOURCES="${LLAMACPP_MODEL_SOURCES:-local,hf-cache,r2,hf-hub}"
 LLAMACPP_RESOLVE_LOCK_TIMEOUT="${LLAMACPP_RESOLVE_LOCK_TIMEOUT:-300}"
-LLAMACPP_REQUIRE_REVISION_FOR_HF="${LLAMACPP_REQUIRE_REVISION_FOR_HF:-1}"
+LLAMACPP_REQUIRE_REVISION_FOR_HF="${LLAMACPP_REQUIRE_REVISION_FOR_HF:-0}"
 LLAMACPP_REQUIRE_IMMUTABLE_REVISION="${LLAMACPP_REQUIRE_IMMUTABLE_REVISION:-0}"
-LLAMACPP_REQUIRE_REVISION_FOR_HF_CACHE="${LLAMACPP_REQUIRE_REVISION_FOR_HF_CACHE:-1}"
-LLAMACPP_REQUIRE_MANIFEST_FOR_SPLIT="${LLAMACPP_REQUIRE_MANIFEST_FOR_SPLIT:-1}"
-LLAMACPP_VALIDATE_ALL_SHARDS="${LLAMACPP_VALIDATE_ALL_SHARDS:-1}"
-LLAMACPP_ALLOW_SNAPSHOT_GGUF="${LLAMACPP_ALLOW_SNAPSHOT_GGUF:-0}"
-LLAMACPP_REQUIRE_FILE_OR_QUANT="${LLAMACPP_REQUIRE_FILE_OR_QUANT:-1}"
 
 mkdir -p "$LLAMACPP_MODELS_DIR"
 
@@ -1179,12 +1006,6 @@ for _src in "${_sources[@]}"; do
 
     hf-cache)
       printf "[model] Checking HF cache... "
-      if [[ "$LLAMACPP_REQUIRE_REVISION_FOR_HF_CACHE" == "1" && -z "$LLAMACPP_MODEL_REVISION" ]]; then
-        echo "skipped (requires revision)"
-        _add_error "hf-cache: LLAMACPP_MODEL_REVISION required (LLAMACPP_REQUIRE_REVISION_FOR_HF_CACHE=1)"
-        continue
-      fi
-
       _cache_dir="${_hf_cache_root%/}/models--${_hf_slug}"
 
       if [[ ! -d "$_cache_dir/snapshots" ]]; then
@@ -1311,127 +1132,61 @@ for _src in "${_sources[@]}"; do
         continue
       fi
 
-      if ! _hf_can_download; then
-        echo "skipped (no HF download tool)"
-        _add_error "hf-hub: need hf, huggingface-cli, or python3+huggingface_hub"
-        continue
-      fi
-
       stage_dir="$(_mk_stage_dir "$_stage_base" "${MODEL_DIR_NAME}.hf")"
       _stage_dirs+=("$stage_dir")
       logfile="$(mktemp "$_stage_base/${MODEL_DIR_NAME}.hf.log.XXXXXX")"
       _logfiles+=("$logfile")
 
-      selected_bn=""
-      did_bulk=0
-      if selected_bn="$(_hf_pick_remote_gguf "$_model_id" "$LLAMACPP_MODEL_REVISION" "$logfile")"; then
+      _hf_filename=""
+      [[ -n "${LLAMACPP_MODEL_FILE:-}" ]] && _hf_filename="$LLAMACPP_MODEL_FILE"
+
+      if _hf_download_gguf_to_dir "$_model_id" "$_hf_filename" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION"; then
         :
       else
         code=$?
-        if [[ "$LLAMACPP_ALLOW_SNAPSHOT_GGUF" == "1" ]]; then
-          echo "fallback (bulk snapshot)"
-          did_bulk=1
-          _hf_filename=""
-          [[ -n "${LLAMACPP_MODEL_FILE:-}" ]] && _hf_filename="$LLAMACPP_MODEL_FILE"
+        if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
+          _die "hf-hub: revision pin requested but the selected tool cannot apply it (see log: $logfile)"
+        fi
+        echo "failed (download error)"
+        _add_error "hf-hub: download failed — tail: $(_tail_one_line "$logfile" 80) (log: $logfile)"
+        stage_dir=""
+        continue
+      fi
 
-          if _hf_download_gguf_to_dir "$_model_id" "$_hf_filename" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION"; then
-            :
-          else
-            code=$?
-            if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
-              _die "hf-hub: revision pin requested but the selected tool cannot apply it (see log: $logfile)"
-            fi
-            echo "failed (download error)"
-            _add_error "hf-hub: download failed — tail: $(_tail_one_line "$logfile" 80) (log: $logfile)"
-            stage_dir=""
-            continue
-          fi
+      # If manifest is required/strict, fetch it too (when LLAMACPP_MANIFEST_PATH is not set)
+      if ! _maybe_download_manifest_hf "$_model_id" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION"; then
+        code=$?
+        if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
+          _die "hf-hub: revision pin requested but the selected tool cannot apply it for manifest download (see log: $logfile)"
+        fi
+        _die "hf-hub: manifest download failed (see log: $logfile)"
+      fi
 
-          if ! _maybe_download_manifest_hf "$_model_id" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION"; then
-            code=$?
-            if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
-              _die "hf-hub: revision pin requested but the selected tool cannot apply it for manifest download (see log: $logfile)"
-            fi
-            _die "hf-hub: manifest download failed (see log: $logfile)"
-          fi
+      _handle_symlinks_stage "$stage_dir"
 
-          _handle_symlinks_stage "$stage_dir"
+      if _gguf_path="$(_find_gguf_in_dir "$stage_dir")"; then
+        _gguf_bn="$(basename "$_gguf_path")"
+        : >"$stage_dir/.complete"
 
-          if _gguf_path="$(_find_gguf_in_dir "$stage_dir")"; then
-            selected_bn="$(basename "$_gguf_path")"
-          else
-            echo "failed (no GGUF)"
-            _add_error "hf-hub: ${_FIND_GGUF_ERR:-no GGUF found in staged dir} (log: $logfile)"
-            stage_dir=""
-            continue
-          fi
+        _verify_and_write_shafile "$stage_dir" "$_gguf_bn" "$SHA_FILE_PATH"
+
+        if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
+          _final_path="$_target_dir/$_gguf_bn"
+          _validate_gguf_path "$_target_dir" "$_final_path" || _die "post-swap GGUF validation failed: ${_FIND_GGUF_ERR:-unknown}"
+          _write_env_final "$(_abspath "$_final_path")" "hf-hub" "$LLAMACPP_MODEL_REVISION" "$_gguf_bn"
+          echo "OK"
+          break
         else
-          echo "failed (selection error)"
-          _add_error "hf-hub: selection failed — tail: $(_tail_one_line "$logfile" 120) (log: $logfile)"
-          stage_dir=""
-          continue
+          echo "failed (swap error)"
+          _add_error "hf-hub: swap into $_target_dir failed (log: $logfile)"
         fi
-      fi
-
-      if [[ -z "$selected_bn" ]]; then
-        echo "failed (no selection)"
-        _add_error "hf-hub: selection produced empty filename (log: $logfile)"
-        stage_dir=""
-        continue
-      fi
-
-      # Download only the selected GGUF (and shards if split), unless we already did a bulk snapshot.
-      if [[ "$did_bulk" == "0" ]]; then
-        _collect_selected_files "$selected_bn"
-        if ! _hf_download_files_to_dir "$_model_id" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION" "${SELECTED_FILES[@]}"; then
-          code=$?
-          if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
-            _die "hf-hub: revision pin requested but the selected tool cannot apply it (see log: $logfile)"
-          fi
-          echo "failed (download error)"
-          _add_error "hf-hub: download failed — tail: $(_tail_one_line "$logfile" 80) (log: $logfile)"
-          stage_dir=""
-          continue
-        fi
-
-        if ! _maybe_download_manifest_hf "$_model_id" "$stage_dir" "$logfile" "$LLAMACPP_MODEL_REVISION"; then
-          code=$?
-          if [[ $code -eq 2 && -n "$LLAMACPP_MODEL_REVISION" ]]; then
-            _die "hf-hub: revision pin requested but the selected tool cannot apply it for manifest download (see log: $logfile)"
-          fi
-          _die "hf-hub: manifest download failed (see log: $logfile)"
-        fi
-
-        _handle_symlinks_stage "$stage_dir"
-      fi
-
-      _final_candidate="$stage_dir/$selected_bn"
-      if ! _validate_gguf_path "$stage_dir" "$_final_candidate"; then
-        echo "failed (invalid GGUF)"
-        _add_error "hf-hub: staged GGUF invalid: ${_FIND_GGUF_ERR:-unknown} (log: $logfile)"
-        stage_dir=""
-        continue
-      fi
-
-      _gguf_bn="$selected_bn"
-      : >"$stage_dir/.complete"
-
-      _verify_and_write_shafile "$stage_dir" "$_gguf_bn" "$SHA_FILE_PATH"
-
-      if _atomic_swap_dir "$stage_dir" "$_target_dir"; then
-        _final_path="$_target_dir/$_gguf_bn"
-        _validate_gguf_path "$_target_dir" "$_final_path" || _die "post-swap GGUF validation failed: ${_FIND_GGUF_ERR:-unknown}"
-        _write_env_final "$(_abspath "$_final_path")" "hf-hub" "$LLAMACPP_MODEL_REVISION" "$_gguf_bn"
-        echo "OK"
-        break
       else
-        echo "failed (swap error)"
-        _add_error "hf-hub: swap into $_target_dir failed (log: $logfile)"
+        echo "failed (no GGUF)"
+        _add_error "hf-hub: ${_FIND_GGUF_ERR:-no GGUF found in staged dir} (log: $logfile)"
       fi
 
       stage_dir=""
       ;;
-
 
     *)
       _warn "Unknown source '$_src' (skipping)"
