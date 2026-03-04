@@ -1,47 +1,65 @@
 #!/usr/bin/env bash
-# llamacpp-serve — Load resolved model env and exec `llama-server` with validated args.
+# llamacpp-serve — load resolved model env and exec `llama-server` with validation and production defaults.
 #
-# Required env:
-#   If LLAMACPP_MODEL_ENV_FILE is NOT set:
-#     FLOX_ENV_CACHE              Cache directory (used to derive the env file path)
-#     and either:
-#       LLAMACPP_MODEL_ID         Full model id (e.g. org/model), OR
-#       LLAMACPP_MODEL_ORG + LLAMACPP_MODEL
+# Script flags:
+#   --print-cmd   Print the final argv (with redaction) to stderr before exec
+#   --dry-run     Print the final argv and exit 0 (do not exec)
+#   --check       Validate config + model path + lock/bind checks, print argv, exit 0
+#   -h, --help    Show help
 #
-#   Always required:
-#     LLAMACPP_HOST               Bind address
-#     LLAMACPP_PORT               Listen port (positive int)
-#     LLAMACPP_N_GPU_LAYERS       GPU layers (-ngl), non-empty (e.g., "auto", "99", "0")
-#     LLAMACPP_CTX_SIZE           Context size (-c), non-negative int
-#     LLAMACPP_PARALLEL           Parallel slots (-np), positive int
+# Env required (unless LLAMACPP_MODEL_ENV_FILE is set):
+#   FLOX_ENV_CACHE              Cache directory (used to derive the env file path)
+#   and either:
+#     LLAMACPP_MODEL_ID         Full model id (e.g. org/model), OR
+#     LLAMACPP_MODEL_ORG + LLAMACPP_MODEL
 #
-# Optional env (included in argv only if set):
-#   LLAMACPP_BATCH_SIZE           → -b
-#   LLAMACPP_UBATCH_SIZE          → -ub
-#   LLAMACPP_FLASH_ATTN           → -fa (true/false/1/0/yes/no)
+# Required:
+#   LLAMACPP_HOST               Bind address or unix socket path ending in .sock
+#   LLAMACPP_N_GPU_LAYERS       GPU layers (-ngl), non-empty (e.g., "auto", "99", "0")
+#   LLAMACPP_CTX_SIZE           Context size (-c), non-negative int
+#   LLAMACPP_PARALLEL           Parallel slots (-np), integer: -1 ("auto") or > 0
+#
+# TCP mode required:
+#   LLAMACPP_PORT               Listen port (1..65535). Ports < 1024 are rejected.
+#
+# Unix socket mode (LLAMACPP_HOST ends with .sock):
+#   LLAMACPP_PORT               Optional. If set, it is validated but not required.
+#
+# Optional env (added only if set):
+#   LLAMACPP_BATCH_SIZE           → -b (positive int)
+#   LLAMACPP_UBATCH_SIZE          → -ub (positive int)
+#   LLAMACPP_FLASH_ATTN           → -fa on/off (true/false/1/0/yes/no)
 #   LLAMACPP_CACHE_TYPE_K         → -ctk
 #   LLAMACPP_CACHE_TYPE_V         → -ctv
 #   LLAMACPP_SPLIT_MODE           → -sm
 #   LLAMACPP_TENSOR_SPLIT         → -ts
-#   LLAMACPP_MAIN_GPU             → -mg
+#   LLAMACPP_MAIN_GPU             → -mg (non-negative int)
 #   LLAMACPP_ALIAS                → -a
-#   LLAMACPP_API_KEY              → --api-key
+#   LLAMACPP_API_KEY              → exported as LLAMA_API_KEY (not placed on argv)
+#   LLAMACPP_API_KEY_FILE         → --api-key-file (path only; must exist and be readable)
 #   LLAMACPP_METRICS              → --metrics (true/false/1/0/yes/no)
 #   LLAMACPP_JINJA                → --jinja / --no-jinja (true/false/1/0/yes/no)
 #   LLAMACPP_CHAT_TEMPLATE        → --chat-template
 #   LLAMACPP_EMBEDDING            → --embedding (true/false/1/0/yes/no)
-#   LLAMACPP_CONT_BATCHING        → --cont-batching (true/false/1/0/yes/no)
+#   LLAMACPP_CONT_BATCHING        → --cont-batching / --no-cont-batching (true/false/1/0/yes/no)
 #   LLAMACPP_WEBUI                → --webui / --no-webui (true/false/1/0/yes/no)
-#   LLAMACPP_TIMEOUT              → -to
-#   LLAMACPP_THREADS              → -t
+#   LLAMACPP_TIMEOUT              → -to (non-negative int)
+#   LLAMACPP_THREADS              → -t (positive int)
 #   LLAMACPP_REASONING_FORMAT     → --reasoning-format
 #
-# SAFE env-file contract:
-#   In SAFE mode (default), the env file must be a restricted .env subset:
-#     - Lines: KEY=VALUE or "export KEY=VALUE"
-#     - Optional quotes: KEY="value" or KEY='value'
-#     - Optional trailing comments after quoted values
-#     - No multiline values, no ${VAR} interpolation, no command substitution.
+# Unix socket stale policy (only if LLAMACPP_HOST ends with .sock):
+#   LLAMACPP_SOCKET_STALE_POLICY=external      (default) refuse to touch existing path
+#   LLAMACPP_SOCKET_STALE_POLICY=safe-cleanup  remove stale socket after liveness check
+#   LLAMACPP_SOCKET_STALE_POLICY=move-aside    move stale socket aside after liveness check
+#
+# Lock dir policy:
+#   - Default lock dir is XDG_RUNTIME_DIR
+#   - If XDG_RUNTIME_DIR is missing and LLAMACPP_LOCK_DIR is not set, the script exits
+#     unless LLAMACPP_ALLOW_TMP_LOCK_DIR=true.
+#
+# Env-file loading modes:
+#   - SAFE (default): accepts a small .env subset; keys are filtered to allowed prefixes.
+#   - TRUSTED: sources the file directly (code execution). Use only for trusted inputs.
 #
 # The env file must define:
 #   _LLAMACPP_RESOLVED_MODEL_PATH
@@ -54,23 +72,15 @@ die() { err "$*"; exit 1; }
 
 on_err() {
   local ec=$?
-  err "llamacpp-serve failed (exit=$ec) at line ${1}: ${2}"
+  err "llamacpp-serve failed (exit=$ec) at line ${1}"
   exit "$ec"
 }
-trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
+trap 'on_err "$LINENO"' ERR
 
 require_nonempty() {
   local name="$1"
   local val="${!name:-}"
   [[ -n "$val" ]] || { err "Missing required env var: $name"; exit 2; }
-}
-
-require_pos_int() {
-  local name="$1"
-  local val="${!name:-}"
-  [[ -n "$val" ]] || { err "Missing required env var: $name"; exit 2; }
-  [[ "$val" =~ ^[0-9]+$ ]] || { err "$name must be a positive integer, got: $val"; exit 2; }
-  [[ "$val" -gt 0 ]] || { err "$name must be > 0, got: $val"; exit 2; }
 }
 
 require_nonneg_int() {
@@ -80,16 +90,38 @@ require_nonneg_int() {
   [[ "$val" =~ ^[0-9]+$ ]] || { err "$name must be a non-negative integer, got: $val"; exit 2; }
 }
 
-is_truthy() {
-  case "${1,,}" in
-    true|1|yes) return 0 ;;
-    *) return 1 ;;
-  esac
+require_parallel() {
+  local val="${LLAMACPP_PARALLEL:-}"
+  [[ -n "$val" ]] || { err "Missing required env var: LLAMACPP_PARALLEL"; exit 2; }
+  [[ "$val" =~ ^-?[0-9]+$ ]] || { err "LLAMACPP_PARALLEL must be an integer (-1 or > 0), got: $val"; exit 2; }
+  if [[ "$val" -eq -1 ]]; then
+    return 0
+  fi
+  [[ "$val" -gt 0 ]] || { err "LLAMACPP_PARALLEL must be -1 or > 0, got: $val"; exit 2; }
 }
 
-is_falsy() {
-  case "${1,,}" in
-    false|0|no|'') return 0 ;;
+validate_optional_pos_int() {
+  local name="$1"
+  local val="${!name:-}"
+  [[ -z "$val" ]] && return 0
+  [[ "$val" =~ ^[0-9]+$ ]] || { err "$name must be a positive integer, got: $val"; exit 2; }
+  [[ "$val" -gt 0 ]] || { err "$name must be > 0, got: $val"; exit 2; }
+}
+
+validate_optional_nonneg_int() {
+  local name="$1"
+  local val="${!name:-}"
+  [[ -z "$val" ]] && return 0
+  [[ "$val" =~ ^[0-9]+$ ]] || { err "$name must be a non-negative integer, got: $val"; exit 2; }
+}
+
+tolower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+is_truthy() {
+  case "$(tolower "${1:-}")" in
+    true|1|yes) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -97,7 +129,7 @@ is_falsy() {
 validate_bool() {
   local name="$1"
   local val="${!name:-}"
-  case "${val,,}" in
+  case "$(tolower "$val")" in
     true|1|yes|false|0|no) return 0 ;;
     *) err "$name must be true/false/1/0/yes/no, got: $val"; exit 2 ;;
   esac
@@ -105,11 +137,12 @@ validate_bool() {
 
 print_help() {
   cat <<'EOF'
-Usage: llamacpp-serve [--print-cmd] [--dry-run] [--] [llama-server args...]
+Usage: llamacpp-serve [--print-cmd] [--dry-run] [--check] [--] [llama-server args...]
 
 Script flags:
-  --print-cmd   Print the final `llama-server ...` argv to stderr before exec
+  --print-cmd   Print the final argv (with redaction) to stderr before exec
   --dry-run     Print the final argv and exit 0 (do not exec)
+  --check       Validate config + model path + lock/bind checks, print argv, exit 0
   -h, --help    Show help
 
 Everything after `--` passes through to llama-server.
@@ -121,22 +154,44 @@ EOF
 # -----------------------------
 PRINT_CMD=0
 DRY_RUN=0
+CHECK_ONLY=0
 EXTRA_ARGS=()
 
 while (($#)); do
   case "$1" in
     --print-cmd) PRINT_CMD=1; shift ;;
     --dry-run)   DRY_RUN=1; shift ;;
+    --check)     CHECK_ONLY=1; shift ;;
     -h|--help)   print_help; exit 0 ;;
     --)          shift; EXTRA_ARGS+=("$@"); break ;;
     *)           EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
 
-# Defaults
-LLAMACPP_ENV_FILE_TRUSTED="${LLAMACPP_ENV_FILE_TRUSTED:-false}"
+# Runtime dirs: favor XDG_RUNTIME_DIR for per-user runtime paths.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 
-# Ensure llama-server exists early
+# Defaults (track whether user set LLAMACPP_LOCK_DIR explicitly)
+LOCK_DIR_SET=0
+if [[ -n "${LLAMACPP_LOCK_DIR+x}" ]]; then
+  LOCK_DIR_SET=1
+fi
+
+LLAMACPP_ENV_FILE_TRUSTED="${LLAMACPP_ENV_FILE_TRUSTED:-false}"
+LLAMACPP_ENV_FILE_ALLOW_PREFIXES="${LLAMACPP_ENV_FILE_ALLOW_PREFIXES:-_LLAMACPP_}"
+LLAMACPP_SINGLETON="${LLAMACPP_SINGLETON:-true}"
+LLAMACPP_ALLOW_TMP_LOCK_DIR="${LLAMACPP_ALLOW_TMP_LOCK_DIR:-false}"
+LLAMACPP_LOCK_DIR="${LLAMACPP_LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
+LLAMACPP_SOCKET_STALE_POLICY="${LLAMACPP_SOCKET_STALE_POLICY:-external}"
+
+# Refuse defaulting lock dir to /tmp unless user opts in.
+if (( ! LOCK_DIR_SET )) && [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+  if ! is_truthy "$LLAMACPP_ALLOW_TMP_LOCK_DIR"; then
+    die "XDG_RUNTIME_DIR is not set; default lock dir would be /tmp. Set LLAMACPP_LOCK_DIR to a user-private dir or set LLAMACPP_ALLOW_TMP_LOCK_DIR=true."
+  fi
+fi
+
+# Check llama-server exists early
 command -v llama-server >/dev/null 2>&1 || die "'llama-server' not found in PATH"
 
 # -----------------------------
@@ -176,6 +231,8 @@ PY
 slugify() {
   printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'
 }
+
+is_unix_socket_host() { [[ "${LLAMACPP_HOST:-}" == *.sock ]]; }
 
 # -----------------------------
 # Resolve env-file path
@@ -220,21 +277,23 @@ fi
 # Load env file
 # -----------------------------
 tmp_env=""
-cleanup() { [[ -n "${tmp_env:-}" && -f "${tmp_env:-}" ]] && rm -f "$tmp_env"; }
-trap cleanup EXIT
+cleanup_tmp() { [[ -n "${tmp_env:-}" && -f "${tmp_env:-}" ]] && rm -f "$tmp_env"; }
+trap cleanup_tmp EXIT
 
 load_env_file_safe() {
   local f="$1"
   local py
-  py="$(pick_python)" || die "SAFE env loading requires python3/python. Install it or set LLAMACPP_ENV_FILE_TRUSTED=true (code execution)."
+  py="$(pick_python)" || die "SAFE env loading needs python3/python. Install it or set LLAMACPP_ENV_FILE_TRUSTED=true (code execution)."
 
-  tmp_env="$(mktemp -t llamacpp_env_exports.XXXXXX)"
+  umask 077
+  TMPDIR="$RUNTIME_DIR" tmp_env="$(mktemp -t llamacpp_env_exports.XXXXXX)"
 
+  LLAMACPP_ENV_FILE_ALLOW_PREFIXES="$LLAMACPP_ENV_FILE_ALLOW_PREFIXES" \
   "$py" - "$f" >"$tmp_env" <<'PY'
-import sys, re, shlex
+import os, sys, re, shlex
 
 path = sys.argv[1]
-out = []
+allowed = [p for p in os.environ.get("LLAMACPP_ENV_FILE_ALLOW_PREFIXES", "_LLAMACPP_").split(",") if p]
 
 line_re = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
 
@@ -255,7 +314,7 @@ def parse_quoted(rest: str):
         val = "".join(buf)
         tail = rest[i:]
         return val, tail
-    # double-quoted: minimal escapes
+
     while i < len(rest):
         c = rest[i]
         if c == '"':
@@ -278,6 +337,7 @@ def parse_quoted(rest: str):
         i += 1
     else:
         raise SystemExit("Unterminated double-quoted value")
+
     val = "".join(buf)
     tail = rest[i:]
     return val, tail
@@ -286,6 +346,10 @@ def strip_unquoted_inline_comment(s: str) -> str:
     m = re.match(r'^(.*?)(?:\s+#.*)?$', s)
     return (m.group(1) if m else s).rstrip()
 
+def is_allowed(k: str) -> bool:
+    return any(k.startswith(p) for p in allowed)
+
+out = []
 with open(path, 'r', encoding='utf-8') as fh:
     for raw in fh:
         line = raw.strip()
@@ -305,6 +369,10 @@ with open(path, 'r', encoding='utf-8') as fh:
                 raise SystemExit(f"Unexpected trailing characters after quoted value: {raw.rstrip()}")
         else:
             val = strip_unquoted_inline_comment(rest)
+
+        if not is_allowed(key):
+            out.append(f"# skipped {key}")
+            continue
 
         out.append(f"export {key}={shlex.quote(val)}")
 
@@ -332,8 +400,8 @@ load_env_file_trusted() {
   set +a
 }
 
-case "${LLAMACPP_ENV_FILE_TRUSTED,,}" in
-  true|1|yes)  load_env_file_trusted "$LLAMACPP_MODEL_ENV_FILE" ;;
+case "$(tolower "$LLAMACPP_ENV_FILE_TRUSTED")" in
+  true|1|yes)    load_env_file_trusted "$LLAMACPP_MODEL_ENV_FILE" ;;
   false|0|no|'') load_env_file_safe "$LLAMACPP_MODEL_ENV_FILE" ;;
   *) err "LLAMACPP_ENV_FILE_TRUSTED must be true/false/1/0/yes/no, got: $LLAMACPP_ENV_FILE_TRUSTED"; exit 2 ;;
 esac
@@ -344,22 +412,235 @@ esac
 # Validate required config/env
 # -----------------------------
 require_nonempty LLAMACPP_HOST
-require_nonempty LLAMACPP_PORT
-[[ "$LLAMACPP_PORT" =~ ^[0-9]+$ ]] || { err "LLAMACPP_PORT must be a positive integer, got: $LLAMACPP_PORT"; exit 2; }
-[[ "$LLAMACPP_PORT" -gt 0 ]] || { err "LLAMACPP_PORT must be > 0, got: $LLAMACPP_PORT"; exit 2; }
+
+if is_unix_socket_host; then
+  if [[ -n "${LLAMACPP_PORT:-}" ]]; then
+    [[ "$LLAMACPP_PORT" =~ ^[0-9]+$ ]] || { err "LLAMACPP_PORT must be an integer (1..65535), got: $LLAMACPP_PORT"; exit 2; }
+    (( LLAMACPP_PORT >= 1 && LLAMACPP_PORT <= 65535 )) || { err "LLAMACPP_PORT must be in range 1..65535, got: $LLAMACPP_PORT"; exit 2; }
+  fi
+else
+  require_nonempty LLAMACPP_PORT
+  [[ "$LLAMACPP_PORT" =~ ^[0-9]+$ ]] || { err "LLAMACPP_PORT must be an integer (1..65535), got: $LLAMACPP_PORT"; exit 2; }
+  (( LLAMACPP_PORT >= 1 && LLAMACPP_PORT <= 65535 )) || { err "LLAMACPP_PORT must be in range 1..65535, got: $LLAMACPP_PORT"; exit 2; }
+  if (( LLAMACPP_PORT < 1024 )); then
+    die "Refusing privileged port ${LLAMACPP_PORT}. Use >=1024 (e.g. 8080/8443) with a reverse proxy, or grant CAP_NET_BIND_SERVICE outside nix/flox."
+  fi
+fi
 
 require_nonempty LLAMACPP_N_GPU_LAYERS
 require_nonneg_int LLAMACPP_CTX_SIZE
-require_pos_int LLAMACPP_PARALLEL
+require_parallel
 
-# Validate the GGUF file still exists
-if [[ ! -f "$_LLAMACPP_RESOLVED_MODEL_PATH" ]]; then
-  # Could be a split GGUF — check if the first part pattern exists
-  if [[ "$_LLAMACPP_RESOLVED_MODEL_PATH" =~ -00001-of- ]]; then
-    [[ -f "$_LLAMACPP_RESOLVED_MODEL_PATH" ]] || die "Resolved model file not found: $_LLAMACPP_RESOLVED_MODEL_PATH"
-  else
-    die "Resolved model file not found: $_LLAMACPP_RESOLVED_MODEL_PATH"
+validate_optional_pos_int LLAMACPP_BATCH_SIZE
+validate_optional_pos_int LLAMACPP_UBATCH_SIZE
+validate_optional_nonneg_int LLAMACPP_TIMEOUT
+validate_optional_pos_int LLAMACPP_THREADS
+validate_optional_nonneg_int LLAMACPP_MAIN_GPU
+
+# -----------------------------
+# Model path handling (single + multi-shard)
+# -----------------------------
+resolved_model_path="$_LLAMACPP_RESOLVED_MODEL_PATH"
+
+if [[ -f "$resolved_model_path" ]]; then
+  :
+else
+  base_no_ext="$resolved_model_path"
+  if [[ "$base_no_ext" == *.gguf ]]; then
+    base_no_ext="${base_no_ext%.gguf}"
   fi
+
+  first_shard_glob="${base_no_ext}-00001-of-*.gguf"
+  shopt -s nullglob
+  matches=( $first_shard_glob )
+  shopt -u nullglob
+
+  if ((${#matches[@]} == 1)); then
+    resolved_model_path="${matches[0]}"
+  elif ((${#matches[@]} > 1)); then
+    err "Multiple first-shard candidates found for: $first_shard_glob"
+    for m in "${matches[@]}"; do err "  $m"; done
+    exit 2
+  fi
+fi
+
+[[ -f "$resolved_model_path" ]] || die "Resolved model file not found: $resolved_model_path"
+[[ -r "$resolved_model_path" ]] || die "Resolved model file not readable: $resolved_model_path"
+
+if [[ "$resolved_model_path" =~ ^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$ ]]; then
+  shard_prefix="${BASH_REMATCH[1]}"
+  shard_first="${BASH_REMATCH[2]}"
+  shard_total="${BASH_REMATCH[3]}"
+
+  if [[ "$shard_first" != "00001" ]]; then
+    die "Resolved model shard is not the first part (expected -00001-of-${shard_total}.gguf): $resolved_model_path"
+  fi
+
+  total=$((10#$shard_total))
+  (( total >= 1 )) || die "Invalid shard total in filename: $resolved_model_path"
+
+  for ((i=1; i<=total; i++)); do
+    part=$(printf '%05d' "$i")
+    f="${shard_prefix}-${part}-of-${shard_total}.gguf"
+    [[ -f "$f" ]] || die "Missing shard: $f"
+    [[ -r "$f" ]] || die "Shard not readable: $f"
+  done
+fi
+
+# -----------------------------
+# Lock (host:port or socket path), with hash to avoid collisions
+# -----------------------------
+LOCK_HELD=0
+
+acquire_lock() {
+  local lock_key="$1"
+
+  if ! is_truthy "$LLAMACPP_SINGLETON"; then
+    return 0
+  fi
+
+  if ! command -v flock >/dev/null 2>&1; then
+    err "flock not found; singleton lock skipped (set LLAMACPP_SINGLETON=false to silence this)."
+    return 0
+  fi
+
+  [[ -d "$LLAMACPP_LOCK_DIR" ]] || die "LLAMACPP_LOCK_DIR is not a directory: $LLAMACPP_LOCK_DIR"
+
+  local lock_slug lock_hash lock_file
+  lock_slug="$(slugify "$lock_key")"
+  lock_hash="$(sha256_12 "$lock_key" 2>/dev/null || true)"
+  [[ -n "$lock_hash" ]] || lock_hash="nohash"
+  lock_file="$LLAMACPP_LOCK_DIR/llamacpp-serve.${lock_slug}.${lock_hash}.lock"
+
+  exec 200>"$lock_file"
+  if ! flock -n 200; then
+    die "Another process holds the lock for ${lock_key} (lock: $lock_file)"
+  fi
+  LOCK_HELD=1
+}
+
+if is_unix_socket_host; then
+  acquire_lock "$LLAMACPP_HOST"
+else
+  acquire_lock "${LLAMACPP_HOST}:${LLAMACPP_PORT}"
+fi
+
+# -----------------------------
+# Port / socket checks (best-effort)
+# -----------------------------
+port_check() {
+  local py
+  py="$(pick_python)" || return 0
+  "$py" - "$LLAMACPP_HOST" "$LLAMACPP_PORT" <<'PY'
+import socket, sys
+host = sys.argv[1]
+port = int(sys.argv[2])
+
+infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+last_err = None
+for family, socktype, proto, canonname, sockaddr in infos:
+    s = socket.socket(family, socktype, proto)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(sockaddr)
+        s.close()
+        sys.exit(0)
+    except OSError as e:
+        last_err = e
+        try:
+            s.close()
+        except Exception:
+            pass
+
+msg = str(last_err) if last_err else "unknown error"
+print(msg, file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+socket_is_live() {
+  local sock="$1"
+  local py
+  py="$(pick_python)" || return 2
+  "$py" - "$sock" <<'PY'
+import socket, sys
+sock_path = sys.argv[1]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+  s.connect(sock_path)
+  sys.exit(0)
+except OSError:
+  sys.exit(1)
+finally:
+  try: s.close()
+  except Exception: pass
+PY
+}
+
+handle_stale_socket() {
+  local sock="$1"
+
+  case "$LLAMACPP_SOCKET_STALE_POLICY" in
+    external|safe-cleanup|move-aside|'') ;;
+    *) die "LLAMACPP_SOCKET_STALE_POLICY must be external/safe-cleanup/move-aside, got: $LLAMACPP_SOCKET_STALE_POLICY" ;;
+  esac
+
+  [[ -e "$sock" ]] || return 0
+
+  if [[ "$LLAMACPP_SOCKET_STALE_POLICY" == "external" || -z "$LLAMACPP_SOCKET_STALE_POLICY" ]]; then
+    die "Unix socket path already exists: $sock (set LLAMACPP_SOCKET_STALE_POLICY=safe-cleanup or move-aside if you want controlled cleanup)"
+  fi
+
+  [[ ! -L "$sock" ]] || die "Refusing to touch symlink socket path: $sock"
+  [[ -S "$sock" ]] || die "Socket path exists but is not a unix socket: $sock"
+
+  if socket_is_live "$sock"; then
+    die "Unix socket appears live/in use: $sock"
+  else
+    local rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+      die "Python is required for LLAMACPP_SOCKET_STALE_POLICY=$LLAMACPP_SOCKET_STALE_POLICY (to test socket liveness)"
+    fi
+  fi
+
+  if [[ "$LLAMACPP_SOCKET_STALE_POLICY" == "safe-cleanup" ]]; then
+    rm -f -- "$sock" || die "Failed to remove stale socket: $sock"
+  else
+    mv -- "$sock" "${sock}.old.$(date +%s).$$" || die "Failed to move aside stale socket: $sock"
+  fi
+}
+
+socket_dir_check() {
+  local sock="$1"
+  local d
+  d="$(dirname "$sock")"
+  [[ -d "$d" ]] || die "Socket directory does not exist: $d"
+  [[ -w "$d" ]] || die "Socket directory not writable: $d"
+}
+
+if is_unix_socket_host; then
+  socket_dir_check "$LLAMACPP_HOST"
+  handle_stale_socket "$LLAMACPP_HOST"
+else
+  if ! port_check; then
+    die "Cannot bind ${LLAMACPP_HOST}:${LLAMACPP_PORT} (port in use or invalid bind address)"
+  fi
+fi
+
+# -----------------------------
+# API key handling
+# -----------------------------
+if [[ -n "${LLAMACPP_API_KEY_FILE:-}" && -n "${LLAMACPP_API_KEY:-}" ]]; then
+  die "Set only one of LLAMACPP_API_KEY or LLAMACPP_API_KEY_FILE"
+fi
+
+if [[ -n "${LLAMACPP_API_KEY_FILE:-}" ]]; then
+  [[ -f "$LLAMACPP_API_KEY_FILE" ]] || die "LLAMACPP_API_KEY_FILE not found: $LLAMACPP_API_KEY_FILE"
+  [[ -r "$LLAMACPP_API_KEY_FILE" ]] || die "LLAMACPP_API_KEY_FILE not readable: $LLAMACPP_API_KEY_FILE"
+fi
+
+if [[ -n "${LLAMACPP_API_KEY:-}" ]]; then
+  export LLAMA_API_KEY="$LLAMACPP_API_KEY"
 fi
 
 # -----------------------------
@@ -367,15 +648,17 @@ fi
 # -----------------------------
 cmd=(
   llama-server
-  -m "$_LLAMACPP_RESOLVED_MODEL_PATH"
+  -m "$resolved_model_path"
   --host "$LLAMACPP_HOST"
-  --port "$LLAMACPP_PORT"
   -ngl "$LLAMACPP_N_GPU_LAYERS"
   -c "$LLAMACPP_CTX_SIZE"
   -np "$LLAMACPP_PARALLEL"
 )
 
-# Optional flags (only included if env var is set and non-empty)
+# Port is always present in TCP mode; optional in unix socket mode.
+if [[ -n "${LLAMACPP_PORT:-}" ]]; then
+  cmd+=(--port "$LLAMACPP_PORT")
+fi
 
 if [[ -n "${LLAMACPP_BATCH_SIZE:-}" ]]; then
   cmd+=(-b "$LLAMACPP_BATCH_SIZE")
@@ -418,8 +701,8 @@ if [[ -n "${LLAMACPP_ALIAS:-}" ]]; then
   cmd+=(-a "$LLAMACPP_ALIAS")
 fi
 
-if [[ -n "${LLAMACPP_API_KEY:-}" ]]; then
-  cmd+=(--api-key "$LLAMACPP_API_KEY")
+if [[ -n "${LLAMACPP_API_KEY_FILE:-}" ]]; then
+  cmd+=(--api-key-file "$LLAMACPP_API_KEY_FILE")
 fi
 
 if [[ -n "${LLAMACPP_METRICS:-}" ]]; then
@@ -453,6 +736,8 @@ if [[ -n "${LLAMACPP_CONT_BATCHING:-}" ]]; then
   validate_bool LLAMACPP_CONT_BATCHING
   if is_truthy "$LLAMACPP_CONT_BATCHING"; then
     cmd+=(--cont-batching)
+  else
+    cmd+=(--no-cont-batching)
   fi
 fi
 
@@ -481,13 +766,116 @@ if ((${#EXTRA_ARGS[@]})); then
   cmd+=("${EXTRA_ARGS[@]}")
 fi
 
-if ((PRINT_CMD || DRY_RUN)); then
+# -----------------------------
+# argv printing with redaction
+# -----------------------------
+looks_secret_header() {
+  local v
+  v="$(tolower "$1")"
+  case "$v" in
+    authorization:*|proxy-authorization:*|cookie:*|set-cookie:*|x-api-key:*|api-key:*)
+      return 0
+      ;;
+  esac
+  case "$v" in
+    *bearer*|*token*|*apikey*|*api-key*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_secret_flag() {
+  case "$1" in
+    --api-key|--token|--access-token|--api-token|--auth|--authorization|--password|--secret|--jwt|--bearer)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_header_flag() {
+  case "$1" in
+    --header|-H|--http-header)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+redact_one() {
+  local a="$1"
+  case "$a" in
+    --api-key=*|--token=*|--access-token=*|--api-token=*|--auth=*|--authorization=*|--password=*|--secret=*|--jwt=*|--bearer=*)
+      printf '%s' "${a%%=*}=<redacted>"
+      return 0
+      ;;
+    --header=*|--http-header=*)
+      local flag="${a%%=*}"
+      local val="${a#*=}"
+      if looks_secret_header "$val"; then
+        printf '%s' "${flag}=<redacted>"
+      else
+        printf '%s' "$a"
+      fi
+      return 0
+      ;;
+  esac
+  printf '%s' "$a"
+}
+
+print_cmd_redacted() {
+  local out=()
+  local i=0
+
+  while (( i < ${#cmd[@]} )); do
+    local a="${cmd[$i]}"
+
+    local ra
+    ra="$(redact_one "$a")"
+    if [[ "$ra" != "$a" ]]; then
+      out+=("$ra")
+      i=$((i+1))
+      continue
+    fi
+
+    if is_secret_flag "$a"; then
+      out+=("$a" "<redacted>")
+      i=$((i+2))
+      continue
+    fi
+
+    if is_header_flag "$a"; then
+      out+=("$a")
+      if (( i + 1 < ${#cmd[@]} )); then
+        local hv="${cmd[$((i+1))]}"
+        if looks_secret_header "$hv"; then
+          out+=("<redacted>")
+        else
+          out+=("$hv")
+        fi
+      fi
+      i=$((i+2))
+      continue
+    fi
+
+    out+=("$a")
+    i=$((i+1))
+  done
+
   printf 'CMD:' >&2
-  for a in "${cmd[@]}"; do printf ' %q' "$a" >&2; done
+  for a in "${out[@]}"; do printf ' %q' "$a" >&2; done
   printf '\n' >&2
+}
+
+if ((PRINT_CMD || DRY_RUN || CHECK_ONLY)); then
+  print_cmd_redacted
 fi
 
-if ((DRY_RUN)); then
+if ((DRY_RUN || CHECK_ONLY)); then
+  if ((LOCK_HELD)); then
+    exec 200>&-
+  fi
   exit 0
 fi
 

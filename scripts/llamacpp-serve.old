@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+# llamacpp-serve — Load resolved model env and exec `llama-server` with validated args.
+#
+# Required env:
+#   If LLAMACPP_MODEL_ENV_FILE is NOT set:
+#     FLOX_ENV_CACHE              Cache directory (used to derive the env file path)
+#     and either:
+#       LLAMACPP_MODEL_ID         Full model id (e.g. org/model), OR
+#       LLAMACPP_MODEL_ORG + LLAMACPP_MODEL
+#
+#   Always required:
+#     LLAMACPP_HOST               Bind address
+#     LLAMACPP_PORT               Listen port (positive int)
+#     LLAMACPP_N_GPU_LAYERS       GPU layers (-ngl), non-empty (e.g., "auto", "99", "0")
+#     LLAMACPP_CTX_SIZE           Context size (-c), non-negative int
+#     LLAMACPP_PARALLEL           Parallel slots (-np), positive int
+#
+# Optional env (included in argv only if set):
+#   LLAMACPP_BATCH_SIZE           → -b
+#   LLAMACPP_UBATCH_SIZE          → -ub
+#   LLAMACPP_FLASH_ATTN           → -fa (true/false/1/0/yes/no)
+#   LLAMACPP_CACHE_TYPE_K         → -ctk
+#   LLAMACPP_CACHE_TYPE_V         → -ctv
+#   LLAMACPP_SPLIT_MODE           → -sm
+#   LLAMACPP_TENSOR_SPLIT         → -ts
+#   LLAMACPP_MAIN_GPU             → -mg
+#   LLAMACPP_ALIAS                → -a
+#   LLAMACPP_API_KEY              → --api-key
+#   LLAMACPP_METRICS              → --metrics (true/false/1/0/yes/no)
+#   LLAMACPP_JINJA                → --jinja / --no-jinja (true/false/1/0/yes/no)
+#   LLAMACPP_CHAT_TEMPLATE        → --chat-template
+#   LLAMACPP_EMBEDDING            → --embedding (true/false/1/0/yes/no)
+#   LLAMACPP_CONT_BATCHING        → --cont-batching (true/false/1/0/yes/no)
+#   LLAMACPP_WEBUI                → --webui / --no-webui (true/false/1/0/yes/no)
+#   LLAMACPP_TIMEOUT              → -to
+#   LLAMACPP_THREADS              → -t
+#   LLAMACPP_REASONING_FORMAT     → --reasoning-format
+#
+# SAFE env-file contract:
+#   In SAFE mode (default), the env file must be a restricted .env subset:
+#     - Lines: KEY=VALUE or "export KEY=VALUE"
+#     - Optional quotes: KEY="value" or KEY='value'
+#     - Optional trailing comments after quoted values
+#     - No multiline values, no ${VAR} interpolation, no command substitution.
+#
+# The env file must define:
+#   _LLAMACPP_RESOLVED_MODEL_PATH
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+err() { printf 'ERROR: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+on_err() {
+  local ec=$?
+  err "llamacpp-serve failed (exit=$ec) at line ${1}: ${2}"
+  exit "$ec"
+}
+trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
+
+require_nonempty() {
+  local name="$1"
+  local val="${!name:-}"
+  [[ -n "$val" ]] || { err "Missing required env var: $name"; exit 2; }
+}
+
+require_pos_int() {
+  local name="$1"
+  local val="${!name:-}"
+  [[ -n "$val" ]] || { err "Missing required env var: $name"; exit 2; }
+  [[ "$val" =~ ^[0-9]+$ ]] || { err "$name must be a positive integer, got: $val"; exit 2; }
+  [[ "$val" -gt 0 ]] || { err "$name must be > 0, got: $val"; exit 2; }
+}
+
+require_nonneg_int() {
+  local name="$1"
+  local val="${!name:-}"
+  [[ -n "$val" ]] || { err "Missing required env var: $name"; exit 2; }
+  [[ "$val" =~ ^[0-9]+$ ]] || { err "$name must be a non-negative integer, got: $val"; exit 2; }
+}
+
+is_truthy() {
+  case "${1,,}" in
+    true|1|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_falsy() {
+  case "${1,,}" in
+    false|0|no|'') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_bool() {
+  local name="$1"
+  local val="${!name:-}"
+  case "${val,,}" in
+    true|1|yes|false|0|no) return 0 ;;
+    *) err "$name must be true/false/1/0/yes/no, got: $val"; exit 2 ;;
+  esac
+}
+
+print_help() {
+  cat <<'EOF'
+Usage: llamacpp-serve [--print-cmd] [--dry-run] [--] [llama-server args...]
+
+Script flags:
+  --print-cmd   Print the final `llama-server ...` argv to stderr before exec
+  --dry-run     Print the final argv and exit 0 (do not exec)
+  -h, --help    Show help
+
+Everything after `--` passes through to llama-server.
+EOF
+}
+
+# -----------------------------
+# Script flags
+# -----------------------------
+PRINT_CMD=0
+DRY_RUN=0
+EXTRA_ARGS=()
+
+while (($#)); do
+  case "$1" in
+    --print-cmd) PRINT_CMD=1; shift ;;
+    --dry-run)   DRY_RUN=1; shift ;;
+    -h|--help)   print_help; exit 0 ;;
+    --)          shift; EXTRA_ARGS+=("$@"); break ;;
+    *)           EXTRA_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# Defaults
+LLAMACPP_ENV_FILE_TRUSTED="${LLAMACPP_ENV_FILE_TRUSTED:-false}"
+
+# Ensure llama-server exists early
+command -v llama-server >/dev/null 2>&1 || die "'llama-server' not found in PATH"
+
+# -----------------------------
+# Helpers: python + hash + slug
+# -----------------------------
+pick_python() {
+  if command -v python3 >/dev/null 2>&1; then echo python3; return 0; fi
+  if command -v python  >/dev/null 2>&1; then echo python;  return 0; fi
+  return 1
+}
+
+sha256_12() {
+  local input="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$input" | sha256sum | awk '{print substr($1,1,12)}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$input" | shasum -a 256 | awk '{print substr($1,1,12)}'
+    return 0
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$input" | openssl dgst -sha256 | awk '{print substr($NF,1,12)}'
+    return 0
+  fi
+  local py
+  if py="$(pick_python)"; then
+    "$py" - "$input" <<'PY'
+import hashlib, sys
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest()[:12])
+PY
+    return 0
+  fi
+  return 1
+}
+
+slugify() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'
+}
+
+# -----------------------------
+# Resolve env-file path
+# -----------------------------
+LEGACY_ENV_FILE=""
+if [[ -z "${LLAMACPP_MODEL_ENV_FILE:-}" ]]; then
+  require_nonempty FLOX_ENV_CACHE
+  [[ -d "$FLOX_ENV_CACHE" ]] || { err "FLOX_ENV_CACHE is not a directory: $FLOX_ENV_CACHE"; exit 2; }
+
+  _model_id="${LLAMACPP_MODEL_ID:-}"
+  if [[ -z "$_model_id" ]]; then
+    require_nonempty LLAMACPP_MODEL_ORG
+    require_nonempty LLAMACPP_MODEL
+    _model_id="$LLAMACPP_MODEL_ORG/$LLAMACPP_MODEL"
+  fi
+
+  slug="$(slugify "$_model_id")"
+  LEGACY_ENV_FILE="$FLOX_ENV_CACHE/llamacpp-model.${slug}.env"
+
+  if hash12="$(sha256_12 "$_model_id")"; then
+    LLAMACPP_MODEL_ENV_FILE="$FLOX_ENV_CACHE/llamacpp-model.${slug}.${hash12}.env"
+  else
+    LLAMACPP_MODEL_ENV_FILE="$LEGACY_ENV_FILE"
+  fi
+
+  if [[ ! -f "$LLAMACPP_MODEL_ENV_FILE" && -n "$LEGACY_ENV_FILE" && -f "$LEGACY_ENV_FILE" ]]; then
+    LLAMACPP_MODEL_ENV_FILE="$LEGACY_ENV_FILE"
+  fi
+fi
+
+if [[ ! -f "$LLAMACPP_MODEL_ENV_FILE" ]]; then
+  err "Model env file not found: $LLAMACPP_MODEL_ENV_FILE"
+  if [[ -n "${LEGACY_ENV_FILE:-}" && "$LEGACY_ENV_FILE" != "$LLAMACPP_MODEL_ENV_FILE" ]]; then
+    err "Also tried legacy path: $LEGACY_ENV_FILE"
+  fi
+  err "Run llamacpp-resolve-model first (or set LLAMACPP_MODEL_ENV_FILE)."
+  exit 1
+fi
+[[ -r "$LLAMACPP_MODEL_ENV_FILE" ]] || die "Model env file not readable: $LLAMACPP_MODEL_ENV_FILE"
+
+# -----------------------------
+# Load env file
+# -----------------------------
+tmp_env=""
+cleanup() { [[ -n "${tmp_env:-}" && -f "${tmp_env:-}" ]] && rm -f "$tmp_env"; }
+trap cleanup EXIT
+
+load_env_file_safe() {
+  local f="$1"
+  local py
+  py="$(pick_python)" || die "SAFE env loading requires python3/python. Install it or set LLAMACPP_ENV_FILE_TRUSTED=true (code execution)."
+
+  tmp_env="$(mktemp -t llamacpp_env_exports.XXXXXX)"
+
+  "$py" - "$f" >"$tmp_env" <<'PY'
+import sys, re, shlex
+
+path = sys.argv[1]
+out = []
+
+line_re = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
+
+def parse_quoted(rest: str):
+    q = rest[0]
+    i = 1
+    buf = []
+    if q == "'":
+        while i < len(rest):
+            c = rest[i]
+            if c == "'":
+                i += 1
+                break
+            buf.append(c)
+            i += 1
+        else:
+            raise SystemExit("Unterminated single-quoted value")
+        val = "".join(buf)
+        tail = rest[i:]
+        return val, tail
+    # double-quoted: minimal escapes
+    while i < len(rest):
+        c = rest[i]
+        if c == '"':
+            i += 1
+            break
+        if c == '\\':
+            i += 1
+            if i >= len(rest):
+                buf.append('\\')
+                break
+            e = rest[i]
+            if e == 'n': buf.append('\n')
+            elif e == 't': buf.append('\t')
+            elif e == '"': buf.append('"')
+            elif e == '\\': buf.append('\\')
+            else: buf.append(e)
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    else:
+        raise SystemExit("Unterminated double-quoted value")
+    val = "".join(buf)
+    tail = rest[i:]
+    return val, tail
+
+def strip_unquoted_inline_comment(s: str) -> str:
+    m = re.match(r'^(.*?)(?:\s+#.*)?$', s)
+    return (m.group(1) if m else s).rstrip()
+
+with open(path, 'r', encoding='utf-8') as fh:
+    for raw in fh:
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        m = line_re.match(line)
+        if not m:
+            raise SystemExit(f"Unsupported env line (expected KEY=VALUE): {raw.rstrip()}")
+
+        key, rest = m.group(1), m.group(2).lstrip()
+
+        if rest.startswith(("'", '"')):
+            val, tail = parse_quoted(rest)
+            tail = tail.strip()
+            if tail and not tail.startswith('#'):
+                raise SystemExit(f"Unexpected trailing characters after quoted value: {raw.rstrip()}")
+        else:
+            val = strip_unquoted_inline_comment(rest)
+
+        out.append(f"export {key}={shlex.quote(val)}")
+
+sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+PY
+
+  set -a
+  set +u
+  # shellcheck disable=SC1090
+  source "$tmp_env"
+  set -u
+  set +a
+
+  rm -f "$tmp_env"
+  tmp_env=""
+}
+
+load_env_file_trusted() {
+  local f="$1"
+  set -a
+  set +u
+  # shellcheck disable=SC1090
+  source "$f"
+  set -u
+  set +a
+}
+
+case "${LLAMACPP_ENV_FILE_TRUSTED,,}" in
+  true|1|yes)  load_env_file_trusted "$LLAMACPP_MODEL_ENV_FILE" ;;
+  false|0|no|'') load_env_file_safe "$LLAMACPP_MODEL_ENV_FILE" ;;
+  *) err "LLAMACPP_ENV_FILE_TRUSTED must be true/false/1/0/yes/no, got: $LLAMACPP_ENV_FILE_TRUSTED"; exit 2 ;;
+esac
+
+[[ -n "${_LLAMACPP_RESOLVED_MODEL_PATH:-}" ]] || die "Env file did not set _LLAMACPP_RESOLVED_MODEL_PATH: $LLAMACPP_MODEL_ENV_FILE"
+
+# -----------------------------
+# Validate required config/env
+# -----------------------------
+require_nonempty LLAMACPP_HOST
+require_nonempty LLAMACPP_PORT
+[[ "$LLAMACPP_PORT" =~ ^[0-9]+$ ]] || { err "LLAMACPP_PORT must be a positive integer, got: $LLAMACPP_PORT"; exit 2; }
+[[ "$LLAMACPP_PORT" -gt 0 ]] || { err "LLAMACPP_PORT must be > 0, got: $LLAMACPP_PORT"; exit 2; }
+
+require_nonempty LLAMACPP_N_GPU_LAYERS
+require_nonneg_int LLAMACPP_CTX_SIZE
+require_pos_int LLAMACPP_PARALLEL
+
+# Validate the GGUF file still exists
+if [[ ! -f "$_LLAMACPP_RESOLVED_MODEL_PATH" ]]; then
+  # Could be a split GGUF — check if the first part pattern exists
+  if [[ "$_LLAMACPP_RESOLVED_MODEL_PATH" =~ -00001-of- ]]; then
+    [[ -f "$_LLAMACPP_RESOLVED_MODEL_PATH" ]] || die "Resolved model file not found: $_LLAMACPP_RESOLVED_MODEL_PATH"
+  else
+    die "Resolved model file not found: $_LLAMACPP_RESOLVED_MODEL_PATH"
+  fi
+fi
+
+# -----------------------------
+# Build argv
+# -----------------------------
+cmd=(
+  llama-server
+  -m "$_LLAMACPP_RESOLVED_MODEL_PATH"
+  --host "$LLAMACPP_HOST"
+  --port "$LLAMACPP_PORT"
+  -ngl "$LLAMACPP_N_GPU_LAYERS"
+  -c "$LLAMACPP_CTX_SIZE"
+  -np "$LLAMACPP_PARALLEL"
+)
+
+# Optional flags (only included if env var is set and non-empty)
+
+if [[ -n "${LLAMACPP_BATCH_SIZE:-}" ]]; then
+  cmd+=(-b "$LLAMACPP_BATCH_SIZE")
+fi
+
+if [[ -n "${LLAMACPP_UBATCH_SIZE:-}" ]]; then
+  cmd+=(-ub "$LLAMACPP_UBATCH_SIZE")
+fi
+
+if [[ -n "${LLAMACPP_FLASH_ATTN:-}" ]]; then
+  validate_bool LLAMACPP_FLASH_ATTN
+  if is_truthy "$LLAMACPP_FLASH_ATTN"; then
+    cmd+=(-fa on)
+  else
+    cmd+=(-fa off)
+  fi
+fi
+
+if [[ -n "${LLAMACPP_CACHE_TYPE_K:-}" ]]; then
+  cmd+=(-ctk "$LLAMACPP_CACHE_TYPE_K")
+fi
+
+if [[ -n "${LLAMACPP_CACHE_TYPE_V:-}" ]]; then
+  cmd+=(-ctv "$LLAMACPP_CACHE_TYPE_V")
+fi
+
+if [[ -n "${LLAMACPP_SPLIT_MODE:-}" ]]; then
+  cmd+=(-sm "$LLAMACPP_SPLIT_MODE")
+fi
+
+if [[ -n "${LLAMACPP_TENSOR_SPLIT:-}" ]]; then
+  cmd+=(-ts "$LLAMACPP_TENSOR_SPLIT")
+fi
+
+if [[ -n "${LLAMACPP_MAIN_GPU:-}" ]]; then
+  cmd+=(-mg "$LLAMACPP_MAIN_GPU")
+fi
+
+if [[ -n "${LLAMACPP_ALIAS:-}" ]]; then
+  cmd+=(-a "$LLAMACPP_ALIAS")
+fi
+
+if [[ -n "${LLAMACPP_API_KEY:-}" ]]; then
+  cmd+=(--api-key "$LLAMACPP_API_KEY")
+fi
+
+if [[ -n "${LLAMACPP_METRICS:-}" ]]; then
+  validate_bool LLAMACPP_METRICS
+  if is_truthy "$LLAMACPP_METRICS"; then
+    cmd+=(--metrics)
+  fi
+fi
+
+if [[ -n "${LLAMACPP_JINJA:-}" ]]; then
+  validate_bool LLAMACPP_JINJA
+  if is_truthy "$LLAMACPP_JINJA"; then
+    cmd+=(--jinja)
+  else
+    cmd+=(--no-jinja)
+  fi
+fi
+
+if [[ -n "${LLAMACPP_CHAT_TEMPLATE:-}" ]]; then
+  cmd+=(--chat-template "$LLAMACPP_CHAT_TEMPLATE")
+fi
+
+if [[ -n "${LLAMACPP_EMBEDDING:-}" ]]; then
+  validate_bool LLAMACPP_EMBEDDING
+  if is_truthy "$LLAMACPP_EMBEDDING"; then
+    cmd+=(--embedding)
+  fi
+fi
+
+if [[ -n "${LLAMACPP_CONT_BATCHING:-}" ]]; then
+  validate_bool LLAMACPP_CONT_BATCHING
+  if is_truthy "$LLAMACPP_CONT_BATCHING"; then
+    cmd+=(--cont-batching)
+  fi
+fi
+
+if [[ -n "${LLAMACPP_WEBUI:-}" ]]; then
+  validate_bool LLAMACPP_WEBUI
+  if is_truthy "$LLAMACPP_WEBUI"; then
+    cmd+=(--webui)
+  else
+    cmd+=(--no-webui)
+  fi
+fi
+
+if [[ -n "${LLAMACPP_TIMEOUT:-}" ]]; then
+  cmd+=(-to "$LLAMACPP_TIMEOUT")
+fi
+
+if [[ -n "${LLAMACPP_THREADS:-}" ]]; then
+  cmd+=(-t "$LLAMACPP_THREADS")
+fi
+
+if [[ -n "${LLAMACPP_REASONING_FORMAT:-}" ]]; then
+  cmd+=(--reasoning-format "$LLAMACPP_REASONING_FORMAT")
+fi
+
+if ((${#EXTRA_ARGS[@]})); then
+  cmd+=("${EXTRA_ARGS[@]}")
+fi
+
+if ((PRINT_CMD || DRY_RUN)); then
+  printf 'CMD:' >&2
+  for a in "${cmd[@]}"; do printf ' %q' "$a" >&2; done
+  printf '\n' >&2
+fi
+
+if ((DRY_RUN)); then
+  exit 0
+fi
+
+exec "${cmd[@]}"
