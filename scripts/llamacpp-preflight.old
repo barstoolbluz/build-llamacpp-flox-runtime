@@ -49,8 +49,7 @@
 #   LLAMACPP_KILL_PG              If set to 1, prefer signaling the process group when the root PID is a group leader.
 #                                 Otherwise, kill a discovered process tree (default: 0).
 #
-#   LLAMACPP_PREFLIGHT_LOCKDIR    Directory for the lock file (default: XDG_RUNTIME_DIR or /run/user/<uid>; root uses /run/llamacpp-preflight; fallback: /tmp)
-#   LLAMACPP_PREFLIGHT_LOCKFILE   Lock file path (overrides LLAMACPP_PREFLIGHT_LOCKDIR)
+#   LLAMACPP_PREFLIGHT_LOCKFILE   Lock file path (default: /tmp/llamacpp-preflight.<port>.lock)
 #   LLAMACPP_HOLD_LOCK            If set to 1 and a downstream command is provided, keep the lock held
 #                                 for the lifetime of the downstream process (requires flock). Default: 0.
 #
@@ -195,76 +194,15 @@ if [[ -n "$LLAMACPP_GPU_MIN_FREE_MIB" ]]; then
   (( LLAMACPP_GPU_MIN_FREE_MIB >= 0 )) || die "LLAMACPP_GPU_MIN_FREE_MIB must be >= 0"
 fi
 
-# Default lock scope: per-port (override via LLAMACPP_PREFLIGHT_LOCKFILE / LLAMACPP_PREFLIGHT_LOCKDIR)
-LLAMACPP_PREFLIGHT_LOCKDIR="${LLAMACPP_PREFLIGHT_LOCKDIR:-}"
-if [[ -z "${LLAMACPP_PREFLIGHT_LOCKFILE:-}" ]]; then
-  _base_lockdir=""
-  if [[ -n "$LLAMACPP_PREFLIGHT_LOCKDIR" ]]; then
-    _base_lockdir="$LLAMACPP_PREFLIGHT_LOCKDIR"
-  elif [[ "$EUID" -eq 0 ]]; then
-    _base_lockdir="/run/llamacpp-preflight"
-  elif [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR:-}" && -w "${XDG_RUNTIME_DIR:-}" ]]; then
-    _base_lockdir="$XDG_RUNTIME_DIR"
-  elif [[ -d "/run/user/$EUID" && -w "/run/user/$EUID" ]]; then
-    _base_lockdir="/run/user/$EUID"
-  else
-    _base_lockdir="/tmp"
-  fi
-  # Best-effort: create the directory when it does not exist.
-  if [[ ! -d "$_base_lockdir" ]]; then
-    if [[ "$EUID" -eq 0 ]]; then
-      mkdir -p -m 0755 "$_base_lockdir" 2>/dev/null || true
-    else
-      mkdir -p -m 0700 "$_base_lockdir" 2>/dev/null || true
-    fi
-  fi
-  LLAMACPP_PREFLIGHT_LOCKFILE="${_base_lockdir%/}/llamacpp-preflight.${LLAMACPP_PORT}.lock"
-fi
-
-# Refuse unsafe defaults when running as root.
-if [[ "$EUID" -eq 0 && "$LLAMACPP_PREFLIGHT_LOCKFILE" == /tmp/* ]]; then
-  die "Refusing to use /tmp for the lock when running as root. Set LLAMACPP_PREFLIGHT_LOCKFILE or LLAMACPP_PREFLIGHT_LOCKDIR to a path under /run or /var/lock."
-fi
-
+# Default lock scope: per-port (override via LLAMACPP_PREFLIGHT_LOCKFILE)
+LLAMACPP_PREFLIGHT_LOCKFILE="${LLAMACPP_PREFLIGHT_LOCKFILE:-/tmp/llamacpp-preflight.${LLAMACPP_PORT}.lock}"
 _lock_kind=""
 _lockdir=""
 _pidfile=""
-_startfile=""
-
-# Helper: read /proc/<pid>/stat start time (field 22 overall; field 20 after the ') ' split).
-_proc_starttime() {
-  local pid="$1" s rest
-  s="$(cat "/proc/${pid}/stat" 2>/dev/null || true)"
-  [[ -n "$s" ]] || return 1
-  rest="${s##*) }"
-  # shellcheck disable=SC2086
-  set -- $rest
-  [[ -n "${20:-}" ]] || return 1
-  printf '%s' "${20}"
-}
-
-_lock_parent="$(dirname "$LLAMACPP_PREFLIGHT_LOCKFILE")"
 
 # --- lock to prevent two preflights fighting each other ---
 if command -v flock >/dev/null 2>&1; then
-  # Parent directory checks; when running as root, avoid group/other-writable dirs.
-  if [[ -L "$_lock_parent" ]]; then
-    die "Lock parent exists but is a symlink: $_lock_parent"
-  fi
-  if [[ ! -d "$_lock_parent" ]]; then
-    die "Lock parent directory does not exist: $_lock_parent"
-  fi
-  if [[ "$EUID" -eq 0 ]]; then
-    _perm="$(stat -Lc %a "$_lock_parent" 2>/dev/null || true)"
-    if [[ "$_perm" =~ ^[0-9]+$ ]]; then
-      _perm8=$((8#${_perm}))
-      if (( (_perm8 & 0022) != 0 )); then
-        die "Lock parent directory is writable by group/other while running as root: $_lock_parent (mode ${_perm})"
-      fi
-    fi
-  fi
-
-  # Lockfile checks (best-effort; parent dir check above is the main defense for privileged runs).
+  # Lockfile hardening (especially relevant if run with elevated privileges)
   if [[ -e "$LLAMACPP_PREFLIGHT_LOCKFILE" ]]; then
     if [[ -L "$LLAMACPP_PREFLIGHT_LOCKFILE" ]]; then
       die "Lockfile exists but is a symlink: $LLAMACPP_PREFLIGHT_LOCKFILE"
@@ -277,11 +215,6 @@ if command -v flock >/dev/null 2>&1; then
   _old_umask="$(umask)"
   umask 077
   exec 9>>"$LLAMACPP_PREFLIGHT_LOCKFILE"
-  # Re-check after open in case something odd happened.
-  if [[ -L "$LLAMACPP_PREFLIGHT_LOCKFILE" ]]; then
-    umask "$_old_umask"
-    die "Lockfile became a symlink: $LLAMACPP_PREFLIGHT_LOCKFILE"
-  fi
   flock -n 9 || { umask "$_old_umask"; die "Another llamacpp-preflight is running (lock: $LLAMACPP_PREFLIGHT_LOCKFILE)"; }
   umask "$_old_umask"
   _lock_kind="flock"
@@ -289,16 +222,12 @@ else
   # Lockdir fallback with stale detection (best-effort; prefer flock-capable hosts)
   _lockdir="${LLAMACPP_PREFLIGHT_LOCKFILE}.d"
   _pidfile="$_lockdir/pid"
-  _startfile="$_lockdir/start"
 
   if [[ -e "$_lockdir" && -L "$_lockdir" ]]; then
     die "Lockdir exists but is a symlink: $_lockdir"
   fi
   if [[ -e "$_pidfile" && -L "$_pidfile" ]]; then
     die "Lock pidfile exists but is a symlink: $_pidfile"
-  fi
-  if [[ -e "$_startfile" && -L "$_startfile" ]]; then
-    die "Lock startfile exists but is a symlink: $_startfile"
   fi
 
   _old_umask="$(umask)"
@@ -307,43 +236,25 @@ else
   if mkdir -m 700 "$_lockdir" 2>/dev/null; then
     : >"$_pidfile" || true
     echo "$$" >"$_pidfile" 2>/dev/null || true
-    _st="$(_proc_starttime "$$" 2>/dev/null || true)"
-    [[ -n "$_st" ]] && echo "$_st" >"$_startfile" 2>/dev/null || true
     umask "$_old_umask"
-    trap 'rm -f "$_pidfile" "$_startfile" 2>/dev/null || true; rmdir "$_lockdir" 2>/dev/null || true' EXIT
+    trap 'rm -f "$_pidfile" 2>/dev/null || true; rmdir "$_lockdir" 2>/dev/null || true' EXIT
     _lock_kind="lockdir"
   else
     umask "$_old_umask"
     if [[ -d "$_lockdir" && -f "$_pidfile" ]]; then
       _oldpid="$(cat "$_pidfile" 2>/dev/null || true)"
-      _oldst="$(cat "$_startfile" 2>/dev/null || true)"
-
-      _stale="0"
-      if [[ "$_oldpid" =~ ^[0-9]+$ ]]; then
-        if ! kill -0 "$_oldpid" 2>/dev/null; then
-          _stale="1"
-        elif [[ -n "$_oldst" ]]; then
-          _curst="$(_proc_starttime "$_oldpid" 2>/dev/null || true)"
-          if [[ -n "$_curst" && "$_curst" != "$_oldst" ]]; then
-            _stale="1"
-          fi
-        fi
-      fi
-
-      if [[ "$_stale" == "1" ]]; then
-        log "WARNING: Removing stale lockdir (pid $_oldpid no longer matches): $_lockdir"
-        rm -f "$_pidfile" "$_startfile" 2>/dev/null || true
+      if [[ "$_oldpid" =~ ^[0-9]+$ ]] && ! kill -0 "$_oldpid" 2>/dev/null; then
+        log "WARNING: Removing stale lockdir (pid $_oldpid not running): $_lockdir"
+        rm -f "$_pidfile" 2>/dev/null || true
         rmdir "$_lockdir" 2>/dev/null || true
 
         _old_umask2="$(umask)"
         umask 077
         mkdir -m 700 "$_lockdir" 2>/dev/null || { umask "$_old_umask2"; die "Another llamacpp-preflight is running (lockdir: $_lockdir)"; }
         echo "$$" >"$_pidfile" 2>/dev/null || true
-        _st="$(_proc_starttime "$$" 2>/dev/null || true)"
-        [[ -n "$_st" ]] && echo "$_st" >"$_startfile" 2>/dev/null || true
         umask "$_old_umask2"
-        trap 'rm -f "$_pidfile" "$_startfile" 2>/dev/null || true; rmdir "$_lockdir" 2>/dev/null || true' EXIT
-        _lock_kind="lockdir"
+        trap 'rm -f "$_pidfile" 2>/dev/null || true; rmdir "$_lockdir" 2>/dev/null || true' EXIT
+    _lock_kind="lockdir"
       else
         die "Another llamacpp-preflight is running (lockdir: $_lockdir)"
       fi
@@ -363,7 +274,6 @@ release_lock() {
     # Remove the lockdir immediately (trap won't run after exec).
     trap - EXIT || true
     rm -f "$_pidfile" 2>/dev/null || true
-    rm -f "$_startfile" 2>/dev/null || true
     rmdir "$_lockdir" 2>/dev/null || true
   fi
 }
@@ -376,8 +286,7 @@ fi
 
 # --- Preflight core: port reclaim + GPU health check ---
 python3 - "$LLAMACPP_HOST" "$LLAMACPP_PORT" "$EUID" <<'PY'
-import os, sys, socket, struct, time, signal, re, json, subprocess, shutil, ctypes
-from ctypes import c_int, c_uint, c_ulonglong, c_void_p, c_char_p, byref, create_string_buffer, Structure, POINTER
+import os, sys, socket, struct, time, signal, re, json, subprocess, shutil
 from collections import defaultdict
 
 host = sys.argv[1]
@@ -582,33 +491,6 @@ def read_uid(pid: int):
         return None
     return None
 
-def read_stat_rest(pid: int):
-    """Return /proc/<pid>/stat fields after the ') ' split."""
-    try:
-        with open(f"/proc/{pid}/stat", "r") as f:
-            s = f.read()
-        r = s.rfind(")")
-        if r == -1:
-            return None
-        return s[r+2:].split()
-    except Exception:
-        return None
-
-def read_start_time(pid: int):
-    # starttime is field 22 overall, which is index 19 after the ') ' split
-    parts = read_stat_rest(pid)
-    if not parts or len(parts) <= 19:
-        return None
-    try:
-        return int(parts[19])
-    except Exception:
-        return None
-
-def pid_identity_matches(pid: int, expected_start: int) -> bool:
-    cur = read_start_time(pid)
-    return (cur is not None) and (cur == expected_start)
-
-
 def default_is_llamacpp(comm: str, exe: str, cmd: str) -> bool:
     """Default owner detection.
 
@@ -677,51 +559,35 @@ def postorder_iter(children, roots):
     return out
 
 def pid_is_effectively_dead(pid: int) -> bool:
-    parts = read_stat_rest(pid)
-    if not parts:
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            s = f.read()
+        r = s.rfind(")")
+        if r == -1:
+            return False
+        rest = s[r+2:]
+        state = rest.split(" ", 1)[0]
+        return state == "Z"
+    except FileNotFoundError:
+        return True
+    except Exception:
         return False
-    # First field after the ') ' split is process state.
-    return parts[0] == "Z"
 
 def is_alive_for_wait(pid: int) -> bool:
     if not os.path.exists(f"/proc/{pid}"):
         return False
     return not pid_is_effectively_dead(pid)
 
-def kill_pids_tree(roots, expected_roots=None):
-    """Stop a process tree rooted at `roots`.
-
-    expected_roots: optional dict {pid: start_time}. When provided, signals are only sent to
-    root PIDs that still match their recorded start time. This is a PID reuse guard.
-    """
-    if expected_roots is None:
-        expected_roots = {}
-
+def kill_pids_tree(roots):
     # Build an initial snapshot of the process tree under the root(s).
     children = build_children_map()
     targets = postorder_iter(children, roots)
 
-    # Best-effort identity map for guarded kills.
-    expected = {}
     for pid in targets:
-        st = read_start_time(pid)
-        if st is not None:
-            expected[pid] = st
-    for pid, st in expected_roots.items():
-        if st is not None:
-            expected[pid] = st
-
-    def safe_kill(pid: int, sig) -> None:
-        est = expected.get(pid)
-        if est is not None and not pid_identity_matches(pid, est):
-            return
         try:
-            os.kill(pid, sig)
+            os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
-
-    for pid in targets:
-        safe_kill(pid, signal.SIGTERM)
 
     deadline = time.time() + term_grace
     while time.time() < deadline:
@@ -735,22 +601,13 @@ def kill_pids_tree(roots, expected_roots=None):
     kill_targets = list(dict.fromkeys(targets2 + targets))  # de-dupe, keep stable order
 
     for pid in kill_targets:
-        if pid not in expected:
-            st = read_start_time(pid)
-            if st is not None:
-                expected[pid] = st
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
-    for pid in kill_targets:
-        safe_kill(pid, signal.SIGKILL)
-
-
-def kill_process_group_if_safe(root_pid: int, expected_start=None) -> bool:
-    """Best-effort: only kill a process group when root is a group leader and not our own group.
-
-    expected_start: optional /proc start time for PID reuse guard.
-    """
-    if expected_start is not None and not pid_identity_matches(root_pid, expected_start):
-        return False
+def kill_process_group_if_safe(root_pid: int) -> bool:
+    """Best-effort: only kill a process group when root is a group leader and not our own group."""
     try:
         root_pgid = os.getpgid(root_pid)
         our_pgid = os.getpgrp()
@@ -779,7 +636,6 @@ def kill_process_group_if_safe(root_pid: int, expected_start=None) -> bool:
         pass
     return True
 
-
 def port_still_listening(h: str, p: int) -> bool:
     v4_targets, v6_targets = build_targets(h, p)
     for local_addr, state, _ in parse_proc_net("/proc/net/tcp"):
@@ -791,280 +647,68 @@ def port_still_listening(h: str, p: int) -> bool:
                 return True
     return False
 
-
 def gpu_check():
-    """Return (gpu_info_dict, hard_fail_bool). Logs to stderr.
-
-    Container-friendly behavior:
-      - Do NOT assume `nvidia-smi` is present.
-      - First, probe GPU usability by loading the CUDA driver library (libcuda.so.1) and calling
-        cuInit + cuDeviceGetCount.
-      - For memory metrics, prefer NVML via libnvidia-ml.so.1 (commonly mounted by the NVIDIA
-        container runtime). If NVML is unavailable, fall back to `nvidia-smi` when present.
-    """
-    info = {
-        "checked": False,
-        "available": False,
-        "gpus": [],
-        "warned": False,
-        "probe": {"method": None, "error": None},
-        "memory": {"method": None, "error": None},
-    }
-
+    """Return (gpu_info_dict, hard_fail_bool). Logs to stderr."""
+    info = {"checked": False, "available": False, "gpus": [], "warned": False}
     if skip_gpu:
         return info, False
 
+    # Hard mode: if we cannot run nvidia-smi, fail.
+    if not shutil_which("nvidia-smi"):
+        msg = "GPU check skipped (nvidia-smi not found)."
+        if gpu_hard_mode:
+            return {"checked": True, "available": False, "gpus": [], "warned": False, "error": msg}, True
+        print(f"WARNING: {msg}", file=sys.stderr)
+        info["checked"] = True
+        info["available"] = False
+        info["error"] = msg
+        return info, False
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception as e:
+        msg = f"GPU check skipped (nvidia-smi failed: {e})"
+        if gpu_hard_mode:
+            return {"checked": True, "available": False, "gpus": [], "warned": False, "error": msg}, True
+        print(f"WARNING: {msg}", file=sys.stderr)
+        info["checked"] = True
+        info["available"] = False
+        info["error"] = msg
+        return info, False
+
     info["checked"] = True
-
-    def _dlopen_first(names):
-        for name in names:
-            try:
-                return ctypes.CDLL(name)
-            except OSError:
-                continue
-        return None
-
-    def _cuda_probe():
-        out = {
-            "driver_present": False,
-            "device_count": 0,
-            "driver_version": None,
-            "error": None,
-        }
-        lib = _dlopen_first(["libcuda.so.1", "libcuda.so"])
-        if not lib:
-            out["error"] = "CUDA driver library not found (libcuda.so.1)."
-            return out
-
-        try:
-            cuInit = lib.cuInit
-            cuInit.argtypes = [c_uint]
-            cuInit.restype = c_int
-
-            cuDeviceGetCount = lib.cuDeviceGetCount
-            cuDeviceGetCount.argtypes = [POINTER(c_int)]
-            cuDeviceGetCount.restype = c_int
-
-            cuDriverGetVersion = getattr(lib, "cuDriverGetVersion", None)
-            if cuDriverGetVersion is not None:
-                cuDriverGetVersion.argtypes = [POINTER(c_int)]
-                cuDriverGetVersion.restype = c_int
-
-            rc = cuInit(0)
-            if rc != 0:
-                out["error"] = f"CUDA driver init failed (cuInit returned {rc})."
-                return out
-
-            n = c_int(0)
-            rc = cuDeviceGetCount(byref(n))
-            if rc != 0:
-                out["error"] = f"CUDA device query failed (cuDeviceGetCount returned {rc})."
-                return out
-
-            out["driver_present"] = True
-            out["device_count"] = int(n.value)
-
-            if cuDriverGetVersion is not None:
-                v = c_int(0)
-                rc = cuDriverGetVersion(byref(v))
-                if rc == 0:
-                    out["driver_version"] = int(v.value)
-
-            return out
-        except Exception as e:
-            out["error"] = f"CUDA probe raised: {e}"
-            return out
-
-    def _nvml_query():
-        """Query GPU names + memory via NVML (ctypes). Returns (gpus, error)."""
-        lib = _dlopen_first(["libnvidia-ml.so.1", "libnvidia-ml.so"])
-        if not lib:
-            return None, "NVML library not found (libnvidia-ml.so.1)."
-
-        def _err_str(code: int) -> str:
-            try:
-                fn = lib.nvmlErrorString
-                fn.argtypes = [c_int]
-                fn.restype = c_char_p
-                s = fn(code)
-                return s.decode("utf-8", "replace") if s else f"NVML error {code}"
-            except Exception:
-                return f"NVML error {code}"
-
-        def _call(fn, *args):
-            rc = fn(*args)
-            if rc != 0:
-                raise RuntimeError(_err_str(int(rc)))
-
-        try:
-            init = getattr(lib, "nvmlInit_v2", None) or getattr(lib, "nvmlInit", None)
-            shutdown = getattr(lib, "nvmlShutdown", None)
-            if init is None or shutdown is None:
-                return None, "NVML init/shutdown symbols missing."
-
-            init.restype = c_int
-            shutdown.restype = c_int
-
-            _call(init)
-
-            try:
-                get_count = getattr(lib, "nvmlDeviceGetCount_v2", None) or getattr(lib, "nvmlDeviceGetCount", None)
-                get_handle = getattr(lib, "nvmlDeviceGetHandleByIndex_v2", None) or getattr(lib, "nvmlDeviceGetHandleByIndex", None)
-                get_name = getattr(lib, "nvmlDeviceGetName", None)
-                get_mem = getattr(lib, "nvmlDeviceGetMemoryInfo", None)
-
-                if not (get_count and get_handle and get_name and get_mem):
-                    return None, "NVML device query symbols missing."
-
-                get_count.argtypes = [POINTER(c_uint)]
-                get_count.restype = c_int
-
-                get_handle.argtypes = [c_uint, POINTER(c_void_p)]
-                get_handle.restype = c_int
-
-                get_name.argtypes = [c_void_p, c_char_p, c_uint]
-                get_name.restype = c_int
-
-                class NvmlMemory(Structure):
-                    _fields_ = [("total", c_ulonglong), ("free", c_ulonglong), ("used", c_ulonglong)]
-
-                get_mem.argtypes = [c_void_p, POINTER(NvmlMemory)]
-                get_mem.restype = c_int
-
-                cnt = c_uint(0)
-                _call(get_count, byref(cnt))
-
-                gpus = []
-                for idx in range(int(cnt.value)):
-                    h = c_void_p()
-                    _call(get_handle, c_uint(idx), byref(h))
-
-                    name_buf = create_string_buffer(128)
-                    _call(get_name, h, name_buf, c_uint(len(name_buf)))
-                    name = name_buf.value.decode("utf-8", "replace").strip()
-
-                    mem = NvmlMemory()
-                    _call(get_mem, h, byref(mem))
-
-                    total_mib = int(mem.total // (1024 * 1024))
-                    free_mib = int(mem.free // (1024 * 1024))
-                    used_pct = (total_mib - free_mib) / total_mib * 100.0 if total_mib > 0 else 0.0
-
-                    gpus.append(
-                        {
-                            "index": idx,
-                            "name": name,
-                            "total_mib": total_mib,
-                            "free_mib": free_mib,
-                            "used_pct": used_pct,
-                        }
-                    )
-
-                return gpus, None
-            finally:
-                try:
-                    shutdown()
-                except Exception:
-                    pass
-        except Exception as e:
-            return None, f"NVML query failed: {e}"
-
-    # 1) CUDA driver probe (most robust indicator inside containers).
-    cuda = _cuda_probe()
-    info["probe"]["method"] = "cuda_dlopen"
-    info["probe"].update(cuda)
-
-    if not cuda.get("driver_present", False):
-        msg = cuda.get("error") or "CUDA driver not available."
-        info["probe"]["error"] = msg
-        if gpu_hard_mode:
-            return info, True
-        print(f"WARNING: GPU not available ({msg})", file=sys.stderr)
-        return info, False
-
-    if cuda.get("device_count", 0) <= 0:
-        msg = "CUDA driver present but reports 0 devices (container likely not started with GPU access)."
-        info["probe"]["error"] = msg
-        if gpu_hard_mode:
-            return info, True
-        print(f"WARNING: {msg}", file=sys.stderr)
-        return info, False
-
     info["available"] = True
-    dv = cuda.get("driver_version")
-    if dv is not None:
-        print(f"GPU: CUDA driver version {dv} (device count {cuda.get('device_count')})", file=sys.stderr)
-    else:
-        print(f"GPU: CUDA driver available (device count {cuda.get('device_count')})", file=sys.stderr)
 
-    # 2) Memory metrics (NVML first; fall back to nvidia-smi).
-    gpus, nvml_err = _nvml_query()
-    if gpus is not None:
-        info["memory"]["method"] = "nvml"
-        info["gpus"] = gpus
-    else:
-        info["memory"]["error"] = nvml_err
-        if shutil_which("nvidia-smi"):
-            try:
-                out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
-                    text=True,
-                    stderr=subprocess.STDOUT,
-                )
-                smi_gpus = []
-                for idx, line in enumerate(out.strip().splitlines()):
-                    parts = [p.strip() for p in line.rsplit(",", 2)]  # tolerate commas in name
-                    if len(parts) != 3:
-                        print(f"WARNING: Unexpected nvidia-smi output line: {line}", file=sys.stderr)
-                        continue
-                    name, total, free = parts
-                    try:
-                        total_f = float(total)
-                        free_f = float(free)
-                    except ValueError:
-                        print(f"WARNING: Unexpected nvidia-smi numeric fields: {line}", file=sys.stderr)
-                        continue
-                    used_pct = (total_f - free_f) / total_f * 100.0 if total_f > 0 else 0.0
-                    smi_gpus.append(
-                        {
-                            "index": idx,
-                            "name": name,
-                            "total_mib": int(total_f),
-                            "free_mib": int(free_f),
-                            "used_pct": used_pct,
-                        }
-                    )
-                info["memory"]["method"] = "nvidia_smi"
-                info["gpus"] = smi_gpus
-            except Exception as e:
-                info["memory"]["error"] = f"nvidia-smi failed: {e}"
-        else:
-            info["memory"]["method"] = None
-
-    # If we still have no memory metrics, we can only enforce hard thresholds when metrics exist.
-    if not info["gpus"]:
-        msg = "GPU memory metrics unavailable (no NVML and no nvidia-smi)."
-        info["memory"]["error"] = info["memory"]["error"] or msg
-        if gpu_hard_mode:
-            return info, True
-        print(f"WARNING: {msg}", file=sys.stderr)
-        return info, False
-
-    # Apply thresholds when we have per-GPU memory stats.
     hard_fail = False
     warned = False
 
-    for entry in info["gpus"]:
-        idx = entry.get("index")
-        name = entry.get("name", "GPU")
-        total_mib = entry.get("total_mib")
-        free_mib = entry.get("free_mib")
-        used_pct = float(entry.get("used_pct", 0.0))
+    for idx, line in enumerate(out.strip().splitlines()):
+        parts = [p.strip() for p in line.rsplit(",", 2)]  # tolerate commas in name
+        if len(parts) != 3:
+            print(f"WARNING: Unexpected nvidia-smi output line: {line}", file=sys.stderr)
+            continue
+        name, total, free = parts
+        try:
+            total_f = float(total); free_f = float(free)
+        except ValueError:
+            print(f"WARNING: Unexpected nvidia-smi numeric fields: {line}", file=sys.stderr)
+            continue
 
-        if total_mib is not None and free_mib is not None:
-            print(f"GPU {idx}: {name} — {free_mib}MiB free / {total_mib}MiB total ({used_pct:.0f}% used)", file=sys.stderr)
-        else:
-            print(f"GPU {idx}: {name} — memory metrics unavailable", file=sys.stderr)
+        used_pct = (total_f - free_f) / total_f * 100.0 if total_f > 0 else 0.0
+        entry = {
+            "index": idx,
+            "name": name,
+            "total_mib": int(total_f),
+            "free_mib": int(free_f),
+            "used_pct": used_pct,
+        }
+        info["gpus"].append(entry)
+
+        print(f"GPU {idx}: {name} — {int(free_f)}MiB free / {int(total_f)}MiB total ({used_pct:.0f}% used)", file=sys.stderr)
 
         if used_pct > gpu_warn_pct:
             warned = True
@@ -1072,7 +716,7 @@ def gpu_check():
 
         if gpu_fail_pct is not None and used_pct > gpu_fail_pct:
             hard_fail = True
-        if gpu_min_free_mib is not None and (free_mib is None or free_mib < gpu_min_free_mib):
+        if gpu_min_free_mib is not None and free_f < gpu_min_free_mib:
             hard_fail = True
 
     info["warned"] = warned
@@ -1083,7 +727,6 @@ def gpu_check():
         if gpu_min_free_mib is not None:
             thresholds["min_free_mib"] = gpu_min_free_mib
         info["hard_fail_thresholds"] = thresholds
-
     return info, hard_fail
 
 def shutil_which(cmd: str):
@@ -1094,76 +737,6 @@ def shutil_which(cmd: str):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
-
-
-
-_pid_re = re.compile(r"pid=(\d+)")
-
-def ss_listen_pids(listen_port: int):
-    ss = shutil_which("ss")
-    if not ss:
-        return []
-    cmds = [
-        [ss, "-H", "-ltnp", f"sport = :{listen_port}"],
-        [ss, "-H", "-ltnp"],
-    ]
-    out = ""
-    for cmd in cmds:
-        try:
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-            if out:
-                break
-        except Exception:
-            continue
-    if not out:
-        return []
-    pids = set()
-    needle = f":{listen_port}"
-    for line in out.splitlines():
-        if "LISTEN" not in line:
-            continue
-        if needle not in line:
-            continue
-        for m in _pid_re.finditer(line):
-            try:
-                pids.add(int(m.group(1)))
-            except Exception:
-                pass
-    return sorted(pids)
-
-def lsof_listen_pids(listen_port: int):
-    lsof = shutil_which("lsof")
-    if not lsof:
-        return []
-    try:
-        out = subprocess.check_output(
-            [lsof, "-nP", f"-iTCP:{listen_port}", "-sTCP:LISTEN", "-Fp"],
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-    except Exception:
-        return []
-    pids = set()
-    for line in out.splitlines():
-        if line.startswith("p"):
-            try:
-                pids.add(int(line[1:]))
-            except Exception:
-                pass
-    return sorted(pids)
-
-def fallback_listener_pids(listen_port: int):
-    pids = []
-    pids += ss_listen_pids(listen_port)
-    pids += lsof_listen_pids(listen_port)
-    # de-dupe, stable order
-    out = []
-    seen = set()
-    for pid in pids:
-        if pid not in seen:
-            seen.add(pid)
-            out.append(pid)
-    return out
 
 # --- main flow ---
 
@@ -1191,23 +764,14 @@ if unmapped:
 
     mapping_r, unmapped_r = inode_to_pids(inodes_r)
     if unmapped_r:
-        fb_pids = fallback_listener_pids(port)
-        if fb_pids:
-            print(
-                f"WARNING: Listener inode->PID mapping failed; continuing with ss/lsof PID fallback: {', '.join(map(str, fb_pids))}",
-                file=sys.stderr,
-            )
-            mapping = {"fallback": set(fb_pids)}
-        else:
-            detail = (
-                f"Found listener socket(s) on {host}:{port} but could not map inode(s) to PID(s): "
-                + ", ".join(sorted(unmapped_r))
-                + ". Your system may restrict /proc/<pid>/fd visibility; run as the owning user (or relax hidepid), "
-                  "or free the port manually."
-            )
-            fail(4, "listener_unattributable", detail=detail, extra={"unmapped_inodes": sorted(unmapped_r)})
-    else:
-        mapping = mapping_r
+        detail = (
+            f"Found listener socket(s) on {host}:{port} but could not map inode(s) to PID(s): "
+            + ", ".join(sorted(unmapped_r))
+            + ". Your system may restrict /proc/<pid>/fd visibility; run as the owning user (or relax hidepid), "
+              "or free the port manually."
+        )
+        fail(4, "listener_unattributable", detail=detail, extra={"unmapped_inodes": sorted(unmapped_r)})
+    mapping = mapping_r
 
 pids = sorted({pid for s in mapping.values() for pid in s})
 if not pids:
@@ -1216,14 +780,12 @@ if not pids:
 pid_info = []
 llamacpp_pids = []
 non_llamacpp = []
-pid_start = {}
 
 for pid in pids:
     cmd = read_cmdline(pid)
     exe = read_exe(pid)
     uid = read_uid(pid)
     comm = read_comm(pid)
-    pid_start[pid] = read_start_time(pid)
     pid_info.append((pid, uid, comm, exe, cmd))
     if is_llamacpp(comm, cmd, exe):
         llamacpp_pids.append(pid)
@@ -1349,17 +911,15 @@ if not gpu_hard_mode:
     if gpu_hard_fail:
         fail(1, "gpu_hard_fail", detail="GPU hard-fail threshold triggered.", extra={"gpu": gpu_info})
 
-root_expected = {pid: pid_start.get(pid) for pid in llamacpp_pids}
-
 print("Stopping llama-server...", file=sys.stderr)
 
 if kill_pg:
     for root in llamacpp_pids:
-        used = kill_process_group_if_safe(root, root_expected.get(root))
+        used = kill_process_group_if_safe(root)
         if not used:
-            kill_pids_tree([root], expected_roots={root: root_expected.get(root)})
+            kill_pids_tree([root])
 else:
-    kill_pids_tree(llamacpp_pids, expected_roots=root_expected)
+    kill_pids_tree(llamacpp_pids)
 
 deadline = time.time() + free_timeout
 while time.time() < deadline:
