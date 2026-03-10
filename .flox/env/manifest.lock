@@ -1,0 +1,145 @@
+{
+  "lockfile-version": 1,
+  "manifest": {
+    "version": 1,
+    "install": {
+      "git": {
+        "pkg-path": "git"
+      }
+    },
+    "hook": {},
+    "profile": {},
+    "options": {},
+    "build": {
+      "llamacpp-flox-runtime": {
+        "command": "  set -euo pipefail\n\n  SCRIPTS_DIR=\"$FLOX_ENV_PROJECT/scripts\"\n\n  # --- git metadata ---\n  if command -v git >/dev/null 2>&1 && git -C \"$FLOX_ENV_PROJECT\" rev-parse --git-dir >/dev/null 2>&1; then\n    rev_count=$(git -C \"$FLOX_ENV_PROJECT\" rev-list --count HEAD 2>/dev/null || echo \"unknown\")\n    short_rev=$(git -C \"$FLOX_ENV_PROJECT\" rev-parse --short HEAD 2>/dev/null || echo \"unknown\")\n    full_rev=$(git -C \"$FLOX_ENV_PROJECT\" rev-parse HEAD 2>/dev/null || echo \"unknown\")\n    if git -C \"$FLOX_ENV_PROJECT\" diff --quiet HEAD 2>/dev/null && git -C \"$FLOX_ENV_PROJECT\" diff --cached --quiet HEAD 2>/dev/null; then\n      dirty=false\n      dirty_suffix=\"\"\n    else\n      dirty=true\n      dirty_suffix=\"-dirty\"\n    fi\n    recent_log=$(git -C \"$FLOX_ENV_PROJECT\" log --oneline -10 2>/dev/null || echo \"  (unavailable)\")\n  else\n    rev_count=\"unknown\"\n    short_rev=\"unknown\"\n    full_rev=\"unknown\"\n    dirty=\"unknown\"\n    dirty_suffix=\"\"\n    recent_log=\"  (no git repository)\"\n  fi\n\n  version=\"0.1.0+${rev_count}.${short_rev}${dirty_suffix}\"\n\n  # --- install scripts ---\n  mkdir -p \"$out/bin\"\n  for script in llamacpp-preflight llamacpp-resolve-model llamacpp-serve; do\n    install -m 0755 \"$SCRIPTS_DIR/$script\" \"$out/bin/$script\"\n  done\n\n  # --- compute script metadata ---\n  script_info=\"\"\n  for script in llamacpp-preflight llamacpp-resolve-model llamacpp-serve; do\n    f=\"$out/bin/$script\"\n    sha=$(sha256sum \"$f\" | cut -d' ' -f1)\n    bytes=$(wc -c < \"$f\")\n    lines=$(wc -l < \"$f\")\n    script_info=\"${script_info}$(printf '  %-24s sha256:%s  %s bytes  %s lines' \"$script\" \"$sha\" \"$bytes\" \"$lines\")\n\"\n  done\n\n  # --- write BUILD_INFO ---\n  mkdir -p \"$out/share/llamacpp-flox-runtime\"\n  cat > \"$out/share/llamacpp-flox-runtime/BUILD_INFO\" <<EOF\nllamacpp-flox-runtime ${version}\nbuilt: $(date -u +%Y-%m-%dT%H:%M:%SZ)\n\ngit:\n  rev:       ${full_rev}\n  short_rev: ${short_rev}\n  rev_count: ${rev_count}\n  dirty:     ${dirty}\n\nscripts:\n$(printf '%b' \"$script_info\")\n\nrecent changes:\n$(echo \"$recent_log\" | sed 's/^/  /')\nEOF\n",
+        "sandbox": "off",
+        "description": "Runtime scripts for llama.cpp model serving with Flox"
+      }
+    }
+  },
+  "packages": [
+    {
+      "attr_path": "git",
+      "broken": false,
+      "derivation": "/nix/store/pya8g7s5q1d3h6py6l4imdgwsshbf9dq-git-2.53.0.drv",
+      "description": "Distributed version control system",
+      "install_id": "git",
+      "license": "GPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=9dcb002ca1690658be4a04645215baea8b95f31d",
+      "name": "git-2.53.0",
+      "pname": "git",
+      "rev": "9dcb002ca1690658be4a04645215baea8b95f31d",
+      "rev_count": 960399,
+      "rev_date": "2026-03-08T09:52:19Z",
+      "scrape_date": "2026-03-10T04:46:38.080597Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.53.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "doc": "/nix/store/lgbyzfz2j1j7g47331i5684765akl38m-git-2.53.0-doc",
+        "out": "/nix/store/rfbzyqcygzpyh5ncb79n07x8bhws2pq3-git-2.53.0"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "git",
+      "broken": false,
+      "derivation": "/nix/store/dy44mj6l045xckks35nczhqz0rircaiy-git-2.53.0.drv",
+      "description": "Distributed version control system",
+      "install_id": "git",
+      "license": "GPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=9dcb002ca1690658be4a04645215baea8b95f31d",
+      "name": "git-2.53.0",
+      "pname": "git",
+      "rev": "9dcb002ca1690658be4a04645215baea8b95f31d",
+      "rev_count": 960399,
+      "rev_date": "2026-03-08T09:52:19Z",
+      "scrape_date": "2026-03-10T05:23:01.682968Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.53.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "debug": "/nix/store/xr7sgggqixdji66nhax03lwmk25ms7af-git-2.53.0-debug",
+        "doc": "/nix/store/lspm2ph3iad5y9irmh2wms6bm3nhhy76-git-2.53.0-doc",
+        "out": "/nix/store/xz8bzpl5fz92bkhcdmf4g45znvvzcakd-git-2.53.0"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "git",
+      "broken": false,
+      "derivation": "/nix/store/6lngan09yslbkx139sd27qmslpwh4pn2-git-2.53.0.drv",
+      "description": "Distributed version control system",
+      "install_id": "git",
+      "license": "GPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=9dcb002ca1690658be4a04645215baea8b95f31d",
+      "name": "git-2.53.0",
+      "pname": "git",
+      "rev": "9dcb002ca1690658be4a04645215baea8b95f31d",
+      "rev_count": 960399,
+      "rev_date": "2026-03-08T09:52:19Z",
+      "scrape_date": "2026-03-10T06:03:52.409128Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.53.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "doc": "/nix/store/0wx1wdjy7imyv7cp6p6m2l17ycq7n3q4-git-2.53.0-doc",
+        "out": "/nix/store/bmddbpv896f9rgnm0835434qjiqh1psc-git-2.53.0"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "git",
+      "broken": false,
+      "derivation": "/nix/store/hk6gd3pn96hbxk95adl9x0ajcs6giaf0-git-2.53.0.drv",
+      "description": "Distributed version control system",
+      "install_id": "git",
+      "license": "GPL-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=9dcb002ca1690658be4a04645215baea8b95f31d",
+      "name": "git-2.53.0",
+      "pname": "git",
+      "rev": "9dcb002ca1690658be4a04645215baea8b95f31d",
+      "rev_count": 960399,
+      "rev_date": "2026-03-08T09:52:19Z",
+      "scrape_date": "2026-03-10T06:47:06.905585Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.53.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "debug": "/nix/store/i9fi7yqx2z2dryn80w5pr4b1v4nmyida-git-2.53.0-debug",
+        "doc": "/nix/store/frqc9w8q0dxsg7b8w3j0cv1lb9bd6xww-git-2.53.0-doc",
+        "out": "/nix/store/8x49w8i0vafv34rlc6h4a0f7z0z2qpb5-git-2.53.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    }
+  ]
+}

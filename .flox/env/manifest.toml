@@ -11,6 +11,7 @@ version = 1
 
 ## Install Packages --------------------------------------------------
 [install]
+git.pkg-path = "git"
 
 
 ## Environment Variables ---------------------------------------------
@@ -30,10 +31,74 @@ version = 1
 
 
 ## Build and publish your own packages ------------------------------
-[build]
-
 [build.llamacpp-flox-runtime]
-systems = ["aarch64-linux", "x86_64-linux"]
+sandbox = "off"
+description = "Runtime scripts for llama.cpp model serving with Flox"
+command = """
+  set -euo pipefail
+
+  SCRIPTS_DIR="$FLOX_ENV_PROJECT/scripts"
+
+  # --- git metadata ---
+  if command -v git >/dev/null 2>&1 && git -C "$FLOX_ENV_PROJECT" rev-parse --git-dir >/dev/null 2>&1; then
+    rev_count=$(git -C "$FLOX_ENV_PROJECT" rev-list --count HEAD 2>/dev/null || echo "unknown")
+    short_rev=$(git -C "$FLOX_ENV_PROJECT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    full_rev=$(git -C "$FLOX_ENV_PROJECT" rev-parse HEAD 2>/dev/null || echo "unknown")
+    if git -C "$FLOX_ENV_PROJECT" diff --quiet HEAD 2>/dev/null && \
+       git -C "$FLOX_ENV_PROJECT" diff --cached --quiet HEAD 2>/dev/null; then
+      dirty=false
+      dirty_suffix=""
+    else
+      dirty=true
+      dirty_suffix="-dirty"
+    fi
+    recent_log=$(git -C "$FLOX_ENV_PROJECT" log --oneline -10 2>/dev/null || echo "  (unavailable)")
+  else
+    rev_count="unknown"
+    short_rev="unknown"
+    full_rev="unknown"
+    dirty="unknown"
+    dirty_suffix=""
+    recent_log="  (no git repository)"
+  fi
+
+  version="0.1.0+${rev_count}.${short_rev}${dirty_suffix}"
+
+  # --- install scripts ---
+  mkdir -p "$out/bin"
+  for script in llamacpp-preflight llamacpp-resolve-model llamacpp-serve; do
+    install -m 0755 "$SCRIPTS_DIR/$script" "$out/bin/$script"
+  done
+
+  # --- compute script metadata ---
+  script_info=""
+  for script in llamacpp-preflight llamacpp-resolve-model llamacpp-serve; do
+    f="$out/bin/$script"
+    sha=$(sha256sum "$f" | cut -d' ' -f1)
+    bytes=$(wc -c < "$f")
+    lines=$(wc -l < "$f")
+    script_info="${script_info}$(printf '  %-24s sha256:%s  %s bytes  %s lines' "$script" "$sha" "$bytes" "$lines")\n"
+  done
+
+  # --- write BUILD_INFO ---
+  mkdir -p "$out/share/llamacpp-flox-runtime"
+  cat > "$out/share/llamacpp-flox-runtime/BUILD_INFO" <<EOF
+llamacpp-flox-runtime ${version}
+built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+git:
+  rev:       ${full_rev}
+  short_rev: ${short_rev}
+  rev_count: ${rev_count}
+  dirty:     ${dirty}
+
+scripts:
+$(printf '%b' "$script_info")
+
+recent changes:
+$(echo "$recent_log" | sed 's/^/  /')
+EOF
+"""
 
 
 ## Other Environment Options -----------------------------------------

@@ -1,0 +1,26 @@
+2026-03-10T21:46:27.237755Z DEBUG flox: FLOX_VERSION=1.9.0
+2026-03-10T21:46:27.237870Z DEBUG flox::config: Global config directory overridden path="/mnt/arkiv/daedalus/config/flox"
+2026-03-10T21:46:27.238034Z DEBUG flox::utils::init::sentry: Initializing Sentry with DSN: https://85c9526795f5047c99a5247aab616295:@o4506548203094016.ingest.us.sentry.io/4506548241825792
+2026-03-10T21:46:27.243540Z DEBUG flox: set _FLOX_SUBSYSTEM_VERBOSITY=2
+2026-03-10T21:46:27.246898Z DEBUG flox::config: Global config directory overridden path="/mnt/arkiv/daedalus/config/flox"
+2026-03-10T21:46:27.247274Z DEBUG flox::utils::update_notifications: Skipping update check in development mode
+2026-03-10T21:46:27.247362Z DEBUG flox::commands: Metrics collection enabled
+2026-03-10T21:46:27.247458Z DEBUG flox::utils::init::catalog_client: using catalog client with url: https://api.flox.dev
+2026-03-10T21:46:27.251111Z DEBUG flox::commands: feature flags configured=Features { upload: false, qa: false, outputs: false }
+2026-03-10T21:46:27.251246Z DEBUG check-upgrade: flox::utils::metrics: pushing entry to metrics buffer: MetricEntry { subcommand: Some("check-upgrade"), extras: {}, timestamp: 2026-03-10 21:46:27.251192068 +00:00:00, uuid: b40414b8-22b2-4377-87ff-80a0aac67ed0, flox_version: "1.9.0", os_family: Some("Linux"), os_family_release: Some("6.12.63+deb13-amd64"), os: Some("debian"), os_version: Some("13"), empty_flags: [], invocation_sources: ["agentic.claude-code.cli", "agentic.flox-mcp"] }
+2026-03-10T21:46:27.255189Z DEBUG check-upgrade: flox_rust_sdk::models::environment: detected concrete environment type: path
+2026-03-10T21:46:27.255491Z DEBUG check-upgrade: flox_rust_sdk::providers::upgrade_checks: created unlocked upgrade information guard upgrade_information_path="/home/daedalus/dev/builds/build-llamacpp-flox-runtime/.flox/cache/upgrade-checks.json"
+2026-03-10T21:46:27.255511Z DEBUG check-upgrade: flox_rust_sdk::providers::upgrade_checks: lock acquired upgrade_information_path="/home/daedalus/dev/builds/build-llamacpp-flox-runtime/.flox/cache/upgrade-checks.json"
+2026-03-10T21:46:27.255569Z DEBUG check-upgrade:check-upgrade: flox_rust_sdk::models::environment::core_environment: upgrading to_upgrade=""
+2026-03-10T21:46:27.255642Z DEBUG check-upgrade:check-upgrade: flox_rust_sdk::models::environment::core_environment: checking group membership for requested packages
+2026-03-10T21:46:27.255645Z DEBUG check-upgrade:check-upgrade: flox_rust_sdk::models::environment::core_environment: using catalog client to upgrade
+2026-03-10T21:46:27.255648Z DEBUG check-upgrade:check-upgrade: flox_rust_sdk::models::environment::core_environment: upgrading to_upgrade=""
+2026-03-10T21:46:27.255885Z DEBUG check-upgrade:check-upgrade:resolve_manifest:resolve: flox_rust_sdk::providers::catalog: resolving package groups n_groups=1
+2026-03-10T21:46:27.794900Z DEBUG check-upgrade:check-upgrade:resolve_manifest:resolve: flox_rust_sdk::providers::catalog: received resolved package groups n_groups=1
+2026-03-10T21:46:27.795036Z DEBUG check-upgrade:check-upgrade:resolve_manifest: flox_rust_sdk::models::lockfile: no resolution failures detected
+2026-03-10T21:46:27.795545Z DEBUG check-upgrade:check-upgrade:build: flox_rust_sdk::providers::buildenv: bulk checking validity of store_paths (paths passed to stdin) cmd=/nix/store/qb1wfcd8w54i80zh4l98cmn1g58hggvc-nix-2.31.2+1/bin/nix --option extra-experimental-features 'nix-command flakes' path-info --offline --stdin
+2026-03-10T21:46:27.824056Z DEBUG check-upgrade:check-upgrade:build: flox_rust_sdk::providers::buildenv: bulk setting gc roots for store_paths cmd="echo '/nix/store/i9fi7yqx2z2dryn80w5pr4b1v4nmyida-git-2.53.0-debug /nix/store/frqc9w8q0dxsg7b8w3j0cv1lb9bd6xww-git-2.53.0-doc /nix/store/8x49w8i0vafv34rlc6h4a0f7z0z2qpb5-git-2.53.0' | /nix/store/qb1wfcd8w54i80zh4l98cmn1g58hggvc-nix-2.31.2+1/bin/nix --option extra-experimental-features 'nix-command flakes' build --stdin --offline -j 0 --out-link /home/daedalus/.cache/flox/process/.tmpTCAnAc/temp-roots/pre-checked-paths"
+2026-03-10T21:46:27.852425Z DEBUG check-upgrade:check-upgrade:build: flox_rust_sdk::providers::buildenv: using 'auto' store
+2026-03-10T21:46:27.852450Z DEBUG check-upgrade:check-upgrade:build: flox_rust_sdk::providers::buildenv: building environment cmd=/nix/store/qb1wfcd8w54i80zh4l98cmn1g58hggvc-nix-2.31.2+1/bin/nix --option extra-experimental-features 'nix-command flakes' --option pure-eval false --print-build-logs build --no-link --offline --json --file /nix/store/bnp057i2c073y549zg0x15ih78bz3jwg-flox-buildenv-0.0.1/lib/buildenv.nix --argstr manifestLock /home/daedalus/.cache/flox/process/.tmpTCAnAc/.tmpZi6Ni0
+2026-03-10T21:46:28.040356Z DEBUG check-upgrade: flox_rust_sdk::providers::upgrade_checks: wrote upgrade information upgrade_information_path="/home/daedalus/dev/builds/build-llamacpp-flox-runtime/.flox/cache/upgrade-checks.json"
+2026-03-10T21:46:28.040459Z DEBUG flox::commands: removing process tempdir temp_dir="/home/daedalus/.cache/flox/process/.tmpTCAnAc"
