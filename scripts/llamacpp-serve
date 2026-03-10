@@ -52,10 +52,12 @@
 #   LLAMACPP_SOCKET_STALE_POLICY=safe-cleanup  remove stale socket after liveness check
 #   LLAMACPP_SOCKET_STALE_POLICY=move-aside    move stale socket aside after liveness check
 #
-# Lock dir policy:
-#   - Default lock dir is XDG_RUNTIME_DIR
-#   - If XDG_RUNTIME_DIR is missing and LLAMACPP_LOCK_DIR is not set, the script exits
-#     unless LLAMACPP_ALLOW_TMP_LOCK_DIR=true.
+# Lock dir resolution (matches llamacpp-preflight cascade):
+#   1. Explicit LLAMACPP_LOCK_DIR → use it
+#   2. Root (EUID=0) → /run/llamacpp-serve
+#   3. XDG_RUNTIME_DIR exists and writable → use it
+#   4. /run/user/<uid> exists and writable → use it
+#   5. Fallback → /tmp (refused when EUID=0)
 #
 # Env-file loading modes:
 #   - SAFE (default): accepts a small .env subset; keys are filtered to allowed prefixes.
@@ -171,24 +173,34 @@ done
 # Runtime dirs: favor XDG_RUNTIME_DIR for per-user runtime paths.
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 
-# Defaults (track whether user set LLAMACPP_LOCK_DIR explicitly)
-LOCK_DIR_SET=0
-if [[ -n "${LLAMACPP_LOCK_DIR+x}" ]]; then
-  LOCK_DIR_SET=1
-fi
-
 LLAMACPP_ENV_FILE_TRUSTED="${LLAMACPP_ENV_FILE_TRUSTED:-false}"
-LLAMACPP_ENV_FILE_ALLOW_PREFIXES="${LLAMACPP_ENV_FILE_ALLOW_PREFIXES:-_LLAMACPP_}"
+LLAMACPP_ENV_FILE_ALLOW_PREFIXES="${LLAMACPP_ENV_FILE_ALLOW_PREFIXES:-_LLAMACPP_,LLAMACPP_}"
 LLAMACPP_SINGLETON="${LLAMACPP_SINGLETON:-true}"
-LLAMACPP_ALLOW_TMP_LOCK_DIR="${LLAMACPP_ALLOW_TMP_LOCK_DIR:-false}"
-LLAMACPP_LOCK_DIR="${LLAMACPP_LOCK_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
 LLAMACPP_SOCKET_STALE_POLICY="${LLAMACPP_SOCKET_STALE_POLICY:-external}"
 
-# Refuse defaulting lock dir to /tmp unless user opts in.
-if (( ! LOCK_DIR_SET )) && [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
-  if ! is_truthy "$LLAMACPP_ALLOW_TMP_LOCK_DIR"; then
-    die "XDG_RUNTIME_DIR is not set; default lock dir would be /tmp. Set LLAMACPP_LOCK_DIR to a user-private dir or set LLAMACPP_ALLOW_TMP_LOCK_DIR=true."
+# Lock dir resolution (matches llamacpp-preflight cascade).
+if [[ -z "${LLAMACPP_LOCK_DIR:-}" ]]; then
+  if [[ "$EUID" -eq 0 ]]; then
+    LLAMACPP_LOCK_DIR="/run/llamacpp-serve"
+  elif [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR:-}" && -w "${XDG_RUNTIME_DIR:-}" ]]; then
+    LLAMACPP_LOCK_DIR="$XDG_RUNTIME_DIR"
+  elif [[ -d "/run/user/$EUID" && -w "/run/user/$EUID" ]]; then
+    LLAMACPP_LOCK_DIR="/run/user/$EUID"
+  else
+    LLAMACPP_LOCK_DIR="/tmp"
   fi
+  if [[ ! -d "$LLAMACPP_LOCK_DIR" ]]; then
+    if [[ "$EUID" -eq 0 ]]; then
+      mkdir -p -m 0755 "$LLAMACPP_LOCK_DIR" 2>/dev/null || true
+    else
+      mkdir -p -m 0700 "$LLAMACPP_LOCK_DIR" 2>/dev/null || true
+    fi
+  fi
+fi
+
+# Root safety: refuse /tmp for locks.
+if [[ "$EUID" -eq 0 && "$LLAMACPP_LOCK_DIR" == /tmp* ]]; then
+  die "Refusing to use /tmp for locks when running as root. Set LLAMACPP_LOCK_DIR to a path under /run or /var/lock."
 fi
 
 # Check llama-server exists early
@@ -277,7 +289,7 @@ fi
 # Load env file
 # -----------------------------
 tmp_env=""
-cleanup_tmp() { [[ -n "${tmp_env:-}" && -f "${tmp_env:-}" ]] && rm -f "$tmp_env"; }
+cleanup_tmp() { if [[ -n "${tmp_env:-}" && -f "${tmp_env:-}" ]]; then rm -f "$tmp_env"; fi; }
 trap cleanup_tmp EXIT
 
 load_env_file_safe() {
@@ -506,16 +518,51 @@ acquire_lock() {
 
   [[ -d "$LLAMACPP_LOCK_DIR" ]] || die "LLAMACPP_LOCK_DIR is not a directory: $LLAMACPP_LOCK_DIR"
 
+  # Directory safety (matches llamacpp-preflight).
+  if [[ -L "$LLAMACPP_LOCK_DIR" ]]; then
+    die "LLAMACPP_LOCK_DIR is a symlink: $LLAMACPP_LOCK_DIR"
+  fi
+  if [[ "$EUID" -eq 0 ]]; then
+    local _perm
+    _perm="$(stat -Lc %a "$LLAMACPP_LOCK_DIR" 2>/dev/null || true)"
+    if [[ "$_perm" =~ ^[0-9]+$ ]]; then
+      local _perm8=$((8#${_perm}))
+      if (( (_perm8 & 0022) != 0 )); then
+        die "Lock directory is writable by group/other while running as root: $LLAMACPP_LOCK_DIR (mode ${_perm})"
+      fi
+    fi
+  fi
+
   local lock_slug lock_hash lock_file
   lock_slug="$(slugify "$lock_key")"
   lock_hash="$(sha256_12 "$lock_key" 2>/dev/null || true)"
   [[ -n "$lock_hash" ]] || lock_hash="nohash"
   lock_file="$LLAMACPP_LOCK_DIR/llamacpp-serve.${lock_slug}.${lock_hash}.lock"
 
-  exec 200>"$lock_file"
+  # Pre-open symlink check.
+  if [[ -e "$lock_file" ]]; then
+    if [[ -L "$lock_file" ]]; then
+      die "Lock file is a symlink: $lock_file"
+    fi
+    if [[ ! -f "$lock_file" ]]; then
+      die "Lock file exists but is not a regular file: $lock_file"
+    fi
+  fi
+
+  local _old_umask
+  _old_umask="$(umask)"
+  umask 077
+  exec 200>>"$lock_file"
+  # Post-open symlink recheck.
+  if [[ -L "$lock_file" ]]; then
+    umask "$_old_umask"
+    die "Lock file became a symlink: $lock_file"
+  fi
   if ! flock -n 200; then
+    umask "$_old_umask"
     die "Another process holds the lock for ${lock_key} (lock: $lock_file)"
   fi
+  umask "$_old_umask"
   LOCK_HELD=1
 }
 
