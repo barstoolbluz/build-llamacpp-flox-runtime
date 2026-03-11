@@ -33,6 +33,7 @@ git.pkg-path = "git"
 ## Build and publish your own packages ------------------------------
 [build.llamacpp-flox-runtime]
 sandbox = "off"
+version.command = "printf '0.9.1+%s.%s' \"$(git rev-list --count HEAD 2>/dev/null || echo 0)\" \"$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\""
 description = "Runtime scripts for llama.cpp model serving with Flox"
 command = """
   set -euo pipefail
