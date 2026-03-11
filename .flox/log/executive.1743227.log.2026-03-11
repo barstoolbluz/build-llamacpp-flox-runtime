@@ -1,0 +1,6 @@
+2026-03-11T01:34:33.337498Z  INFO flox_activations::cli::executive::log_gc: still watching, woof woof
+2026-03-11T01:34:35.454094Z  INFO monitoring: flox_core::activations: detaching terminated PID pid=1742721 start_id=StartIdentifier { store_path: "/nix/store/hc7cwaq1mhxvzqyl26fp9n6v90wn3nna-environment-develop", timestamp: UnixTimestampMillis(1773192873334) }
+2026-03-11T01:34:35.454128Z  INFO monitoring: flox_activations::cli::executive: running cleanup after all PIDs terminated
+2026-03-11T01:34:35.454134Z  INFO monitoring: flox_activations::cli::executive: running cleanup
+2026-03-11T01:34:35.454145Z  INFO monitoring: flox_activations::cli::executive: did not shut down process-compose reason="no socket"
+2026-03-11T01:34:35.454283Z  INFO monitoring: flox_activations::cli::executive: finished cleanup
