@@ -12,6 +12,7 @@ version = 1
 ## Install Packages --------------------------------------------------
 [install]
 git.pkg-path = "git"
+jq.pkg-path = "jq"
 
 
 ## Environment Variables ---------------------------------------------
@@ -33,7 +34,6 @@ git.pkg-path = "git"
 ## Build and publish your own packages ------------------------------
 [build.llamacpp-flox-runtime]
 sandbox = "off"
-version.command = "printf '0.9.1+%s.%s' \"$(git rev-list --count HEAD 2>/dev/null || echo 0)\" \"$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\""
 description = "Runtime scripts for llama.cpp model serving with Flox"
 command = """
   set -euo pipefail
@@ -100,37 +100,28 @@ recent changes:
 $(echo "$recent_log" | sed 's/^/  /')
 EOF
 
-  # --- build version marker ---
-  build_version_file="$FLOX_ENV_PROJECT/build-version"
-  build_ver="0"
-  build_baseline=""
-  if [[ -f "$build_version_file" ]]; then
-    while IFS='=' read -r key val; do
-      key="${key%%#*}"; key="${key// /}"
-      val="${val%%#*}"; val="${val// /}"
-      case "$key" in
-        BUILD_VERSION)  build_ver="$val" ;;
-        BUILD_BASELINE) build_baseline="$val" ;;
-      esac
-    done < "$build_version_file"
-  fi
-
-  precis=""
-  if [[ -n "$build_baseline" ]] && \
-     git -C "$FLOX_ENV_PROJECT" cat-file -e "${build_baseline}^{commit}" 2>/dev/null; then
-    precis=$(git -C "$FLOX_ENV_PROJECT" log --oneline "${build_baseline}..HEAD" 2>/dev/null || true)
-  fi
-  if [[ -z "$precis" ]]; then
-    precis=$(git -C "$FLOX_ENV_PROJECT" log --oneline 2>/dev/null || echo "(unavailable)")
+  # --- build version marker (pre-computed in build-meta/*.json) ---
+  build_meta="$FLOX_ENV_PROJECT/build-meta/llamacpp-flox-runtime.json"
+  if [[ -f "$build_meta" ]]; then
+    build_ver=$(jq -r '.build_version' "$build_meta")
+    force_inc=$(jq -r '.force_increment' "$build_meta")
+    meta_rev=$(jq -r '.git_rev' "$build_meta")
+    meta_rev_short=$(jq -r '.git_rev_short' "$build_meta")
+    changelog=$(jq -r '.changelog' "$build_meta")
+  else
+    build_ver="0"
+    force_inc="0"
+    meta_rev="unknown"
+    meta_rev_short="unknown"
+    changelog="(no build-meta found)"
   fi
 
   cat > "$out/share/llamacpp-flox-runtime/flox-build-version-${build_ver}" <<MARKER
-llamacpp-flox-runtime build ${build_ver}
-built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-commit: ${full_rev}${dirty_suffix}
-
-changes since build $((build_ver - 1)):
-$(echo "$precis" | sed 's/^/  /')
+build-version: ${build_ver}
+git-rev: ${meta_rev}
+git-rev-short: ${meta_rev_short}
+force-increment: ${force_inc}
+changelog: ${changelog}
 MARKER
 """
 

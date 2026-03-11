@@ -1,0 +1,7 @@
+{
+  "build_version": 9,
+  "force_increment": 0,
+  "git_rev": "cca3236b9290c56fb37295b328b88f6f56b8c8e8",
+  "git_rev_short": "cca3236",
+  "changelog": "Initial versioned build. Add build version marker and dynamic version.command."
+}
