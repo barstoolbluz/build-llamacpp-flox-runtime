@@ -28,6 +28,7 @@
 #   LLAMACPP_SHA256_MANIFEST_NAME  manifest filename to look for in model dir (default: manifest.sha256)
 #   LLAMACPP_REQUIRE_MANIFEST=1    fail if manifest is missing
 #   LLAMACPP_INTEGRITY_STRICT=1    require manifest entry for every selected file (incl. all shards)
+#   LLAMACPP_SKIP_SHA256=1         skip all sha256 computation (fastest startup, no integrity checks)
 #
 # HF symlink policy (staged hf-hub downloads):
 #   LLAMACPP_ALLOW_SYMLINKS=1        allow symlinks in staged dir
@@ -458,7 +459,8 @@ _integrity_verify_files() {
 }
 
 _write_sha_file_atomically() {
-  # Writes "<sha>  <basename>" lines for selected files from dir to out_path.
+  # Writes "# meta:<mtime>:<size> <basename>\n<sha>  <basename>" lines for selected files.
+  # Uses mtime+size cache from existing sha file to skip recomputation when unchanged.
   local out_path="$1"; shift
   local dir="$1"; shift
 
@@ -466,11 +468,17 @@ _write_sha_file_atomically() {
   local tmp
   tmp="$(mktemp "${out_path}.tmp.XXXXXX")"
 
-  local base path sha
+  local base path sha mtime fsize
   : >"$tmp"
   for base in "$@"; do
     path="$dir/$base"
-    sha="$(_sha256_file "$path")" || _die "sha256 tool missing for $path"
+    mtime="$(stat -c '%Y' "$path" 2>/dev/null || echo 0)"
+    fsize="$(stat -c '%s' "$path" 2>/dev/null || echo 0)"
+    sha="$(_sha_from_cache "$out_path" "$base" "$mtime" "$fsize")"
+    if [[ -z "$sha" ]]; then
+      sha="$(_sha256_file "$path")" || _die "sha256 tool missing for $path"
+    fi
+    printf '# meta:%s:%s %s\n' "$mtime" "$fsize" "$base" >>"$tmp"
     printf '%s  %s\n' "$sha" "$base" >>"$tmp"
   done
 
@@ -481,6 +489,31 @@ _write_sha_file_atomically() {
 _sha_from_sha_file() {
   local sha_file="$1" base="$2"
   awk -v f="$base" '$2==f {print $1; exit}' "$sha_file"
+}
+
+_sha_from_cache() {
+  # Check sha file for cached sha with matching mtime+size metadata.
+  # Cache lines: "# meta:<mtime_epoch>:<size_bytes> <basename>"
+  # Returns cached sha on hit, empty string on miss.
+  # Caller must pass current stat values to avoid TOCTOU with meta write.
+  local sha_file="$1" base="$2" cur_mtime="$3" cur_size="$4"
+  [[ -f "$sha_file" ]] || return 0
+
+  local cached_meta
+  cached_meta="$(awk -v f="$base" '$0 ~ /^# meta:/ && $3==f {print $0; exit}' "$sha_file")"
+  [[ -n "$cached_meta" ]] || return 0
+
+  # Parse "# meta:<mtime>:<size> <basename>"
+  local meta_field="${cached_meta#\# }"
+  meta_field="${meta_field%% *}"       # "meta:<mtime>:<size>"
+  local saved_mtime saved_size
+  saved_mtime="${meta_field#meta:}"
+  saved_size="${saved_mtime#*:}"
+  saved_mtime="${saved_mtime%%:*}"
+
+  if [[ "$cur_mtime" == "$saved_mtime" && "$cur_size" == "$saved_size" ]]; then
+    _sha_from_sha_file "$sha_file" "$base"
+  fi
 }
 
 # Collect selected basenames into SELECTED_FILES array
@@ -516,14 +549,20 @@ _write_env_atomically() {
   chmod 600 "$env_file" 2>/dev/null || true
 }
 
-# Verify + write sha file (outside model dirs), returns single-file sha in global RESOLVED_SHA_SINGLE
-RESOLVED_SHA_SINGLE=""
 _verify_and_write_shafile() {
   local dir="$1"
   local gguf_bn="$2"
   local sha_out="$3"
 
-  RESOLVED_SHA_SINGLE=""
+  if [[ "$LLAMACPP_SKIP_SHA256" == "1" ]]; then
+    if [[ -n "${LLAMACPP_EXPECTED_SHA256:-}" ]]; then
+      echo "[warn] LLAMACPP_SKIP_SHA256=1 overrides LLAMACPP_EXPECTED_SHA256 — integrity check skipped" >&2
+    fi
+    if [[ "${LLAMACPP_REQUIRE_MANIFEST:-0}" == "1" ]]; then
+      echo "[warn] LLAMACPP_SKIP_SHA256=1 overrides LLAMACPP_REQUIRE_MANIFEST=1 — integrity check skipped" >&2
+    fi
+    return 0
+  fi
 
   _collect_selected_files "$gguf_bn"
 
@@ -538,10 +577,6 @@ _verify_and_write_shafile() {
 
   _integrity_verify_files "$dir" "$manifest" "$expected" "${SELECTED_FILES[@]}"
   _write_sha_file_atomically "$sha_out" "$dir" "${SELECTED_FILES[@]}"
-
-  if ((${#SELECTED_FILES[@]}==1)); then
-    RESOLVED_SHA_SINGLE="$(_sha256_file "$dir/${SELECTED_FILES[0]}")"
-  fi
 }
 
 # ---------------- Symlink policy (hf-hub stage only) ----------------
@@ -977,6 +1012,7 @@ LLAMACPP_REQUIRE_MANIFEST_FOR_SPLIT="${LLAMACPP_REQUIRE_MANIFEST_FOR_SPLIT:-1}"
 LLAMACPP_VALIDATE_ALL_SHARDS="${LLAMACPP_VALIDATE_ALL_SHARDS:-1}"
 LLAMACPP_ALLOW_SNAPSHOT_GGUF="${LLAMACPP_ALLOW_SNAPSHOT_GGUF:-0}"
 LLAMACPP_REQUIRE_FILE_OR_QUANT="${LLAMACPP_REQUIRE_FILE_OR_QUANT:-1}"
+LLAMACPP_SKIP_SHA256="${LLAMACPP_SKIP_SHA256:-0}"
 
 mkdir -p "$LLAMACPP_MODELS_DIR"
 
@@ -1123,7 +1159,7 @@ _write_env_final() {
   local model_path_abs="$1" via="$2" rev="$3" gguf_bn="$4"
   local sha_single=""
 
-  if [[ ! "$gguf_bn" =~ -00001-of-[0-9]+\.gguf$ ]]; then
+  if [[ "$LLAMACPP_SKIP_SHA256" != "1" && ! "$gguf_bn" =~ -00001-of-[0-9]+\.gguf$ ]]; then
     sha_single="$(_sha_from_sha_file "$SHA_FILE_PATH" "$gguf_bn" || true)"
   fi
 
@@ -1464,6 +1500,8 @@ else
 fi
 if [[ -n "$_resolved_sha" ]]; then
   echo "[model] sha256: $_resolved_sha"
+elif [[ "$LLAMACPP_SKIP_SHA256" == "1" ]]; then
+  echo "[model] sha256: (skipped)"
 fi
 echo "[model] sha256 file: $_resolved_sha_file"
 _env_abs="$(_abspath "$_model_env" 2>/dev/null || printf '%s' "$_model_env")"
