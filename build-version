@@ -1,0 +1,4 @@
+# llamacpp-flox-runtime build version tracker
+# Bump BUILD_VERSION and set BUILD_BASELINE to current HEAD before each release.
+BUILD_VERSION=1
+BUILD_BASELINE=2a9c888

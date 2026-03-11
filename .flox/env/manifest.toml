@@ -98,6 +98,39 @@ $(printf '%b' "$script_info")
 recent changes:
 $(echo "$recent_log" | sed 's/^/  /')
 EOF
+
+  # --- build version marker ---
+  build_version_file="$FLOX_ENV_PROJECT/build-version"
+  build_ver="0"
+  build_baseline=""
+  if [[ -f "$build_version_file" ]]; then
+    while IFS='=' read -r key val; do
+      key="${key%%#*}"; key="${key// /}"
+      val="${val%%#*}"; val="${val// /}"
+      case "$key" in
+        BUILD_VERSION)  build_ver="$val" ;;
+        BUILD_BASELINE) build_baseline="$val" ;;
+      esac
+    done < "$build_version_file"
+  fi
+
+  precis=""
+  if [[ -n "$build_baseline" ]] && \
+     git -C "$FLOX_ENV_PROJECT" cat-file -e "${build_baseline}^{commit}" 2>/dev/null; then
+    precis=$(git -C "$FLOX_ENV_PROJECT" log --oneline "${build_baseline}..HEAD" 2>/dev/null || true)
+  fi
+  if [[ -z "$precis" ]]; then
+    precis=$(git -C "$FLOX_ENV_PROJECT" log --oneline 2>/dev/null || echo "(unavailable)")
+  fi
+
+  cat > "$out/share/llamacpp-flox-runtime/flox-build-version-${build_ver}" <<MARKER
+llamacpp-flox-runtime build ${build_ver}
+built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+commit: ${full_rev}${dirty_suffix}
+
+changes since build $((build_ver - 1)):
+$(echo "$precis" | sed 's/^/  /')
+MARKER
 """
 
 
