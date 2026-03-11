@@ -34,6 +34,7 @@ jq.pkg-path = "jq"
 ## Build and publish your own packages ------------------------------
 [build.llamacpp-flox-runtime]
 sandbox = "off"
+version = "0.9.2"
 description = "Runtime scripts for llama.cpp model serving with Flox"
 command = """
   set -euo pipefail

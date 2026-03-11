@@ -1,7 +1,7 @@
 {
-  "build_version": 9,
+  "build_version": 10,
   "force_increment": 0,
-  "git_rev": "cca3236b9290c56fb37295b328b88f6f56b8c8e8",
-  "git_rev_short": "cca3236",
-  "changelog": "Initial versioned build. Add build version marker and dynamic version.command."
+  "git_rev": "801f9de70fc81bcdbb341ea6e14f63fb7e4cd3cb",
+  "git_rev_short": "801f9de",
+  "changelog": "Switch to triton-style build-meta JSON for version markers."
 }
